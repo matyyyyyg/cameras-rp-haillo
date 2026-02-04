@@ -1,0 +1,7 @@
+# Place model files here:
+# - deploy.prototxt
+# - res10_300x300_ssd_iter_140000_fp16.caffemodel
+# - age_deploy.prototxt
+# - age_net.caffemodel
+# - gender_deploy.prototxt
+# - gender_net.caffemodel

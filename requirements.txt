@@ -1,0 +1,28 @@
+# CCTV Face Analytics - Core Requirements
+# Python 3.9+ (tested on 3.9, 3.10, 3.11)
+# For Raspberry Pi 5 + Hailo-8 AI Accelerator
+
+# Core dependencies
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Face detection models (for non-Hailo systems)
+mtcnn-opencv>=1.0.2
+
+# Base gender classification (Caffe - included in OpenCV)
+# No additional packages needed for test_unified_hailo_caffe.py
+
+# Optional: Install based on which test script you want to run
+# For test_unified_hailo_deepface.py:
+#   pip install deepface tf-keras
+
+# For test_unified_hailo_insightface.py or test_gender_insightface.py:
+#   pip install insightface onnxruntime
+
+# For test_unified_hailo_degirum.py:
+#   pip install degirum degirum-tools
+
+# Hailo platform (Raspberry Pi 5 only - install via apt)
+# sudo apt install hailo-all
+# This provides hailo-platform Python package automatically
+

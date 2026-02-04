@@ -1,0 +1,36 @@
+# Production Requirements - Raspberry Pi 5 + Hailo-8
+# Optimized for hardware-accelerated face detection
+
+# Core dependencies
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Hailo hardware acceleration
+# NOTE: Install via apt, not pip: sudo apt install hailo-all
+# This provides hailo-platform Python bindings automatically
+
+# Gender classification - choose ONE based on your needs:
+
+# Option 1: Caffe (fastest, 18-22 FPS, 85-90% accuracy)
+# Already included in opencv-python - no extra packages needed
+
+# Option 2: DeepFace (8-12 FPS, 93-95% accuracy)
+deepface>=0.0.75
+tf-keras>=2.15.0
+
+# Option 3: InsightFace (12-16 FPS, 95-97% accuracy) - RECOMMENDED
+insightface>=0.7.3
+onnxruntime>=1.16.0
+
+# Option 4: DeGirum Cloud (12-15 FPS, 90-95% accuracy)
+degirum>=0.10.0
+degirum-tools>=0.3.0
+
+# Face detection fallback (for development/testing without Hailo)
+mtcnn-opencv>=1.0.2
+
+# Web dashboard (if using src/main.py)
+flask>=3.0.0
+flask-cors>=4.0.0
+Werkzeug>=3.0.0
+
