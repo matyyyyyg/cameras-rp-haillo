@@ -318,7 +318,14 @@ class KalmanPersonTracker:
     - Hungarian algorithm for optimal assignment
     - Handles occlusions and re-identification
     - Configurable max_age for track retention
+    - ReID: Face embedding gallery for re-identifying returning persons
     """
+
+    # ReID configuration
+    REID_SIMILARITY_THRESHOLD = 0.4   # Cosine similarity threshold (lowered for better recall)
+    GALLERY_MAX_AGE_SECONDS = 600     # How long to remember lost tracks (10 min)
+    GALLERY_MAX_SIZE = 100            # Maximum tracks to store in gallery
+    USE_REID = True                   # Feature flag to enable/disable ReID
 
     def __init__(
         self,
@@ -344,13 +351,94 @@ class KalmanPersonTracker:
         self.trackers: List[KalmanBoxTracker] = []
         self.track_attributes: Dict[int, Dict] = {}  # Store gender/age per track
 
+        # ReID: Gallery for storing embeddings of lost tracks
+        self.track_gallery: Dict[int, Dict] = {}
+        # Gallery entry format: {
+        #     'embedding': np.ndarray (512-dim),
+        #     'last_seen': float (timestamp),
+        #     'attributes': dict (gender, age, etc.)
+        # }
+
         # Reset ID counter for fresh start
         KalmanBoxTracker.count = 0
 
         logger.info(
             f"KalmanPersonTracker initialized: sensor={sensor_id}, "
-            f"max_age={max_age}, min_hits={min_hits}, iou_threshold={iou_threshold}"
+            f"max_age={max_age}, min_hits={min_hits}, iou_threshold={iou_threshold}, "
+            f"reid={'enabled' if self.USE_REID else 'disabled'}"
         )
+
+    def _find_gallery_match(self, embedding: np.ndarray) -> Optional[int]:
+        """
+        Find matching track ID in gallery using cosine similarity.
+
+        Args:
+            embedding: 512-dim L2-normalized face embedding
+
+        Returns:
+            Track ID of best match, or None if no match above threshold
+        """
+        if embedding is None or not self.USE_REID:
+            return None
+
+        best_id = None
+        best_sim = 0.0
+        current_time = time.time()
+        expired_ids = []
+
+        for track_id, data in self.track_gallery.items():
+            # Check for expired entries
+            if current_time - data['last_seen'] > self.GALLERY_MAX_AGE_SECONDS:
+                expired_ids.append(track_id)
+                continue
+
+            gallery_emb = data.get('embedding')
+            if gallery_emb is None:
+                continue
+
+            # Cosine similarity (embeddings are L2-normalized, so dot product = cosine sim)
+            similarity = float(np.dot(embedding, gallery_emb))
+
+            if similarity > self.REID_SIMILARITY_THRESHOLD and similarity > best_sim:
+                best_sim = similarity
+                best_id = track_id
+
+        # Clean up expired entries
+        for track_id in expired_ids:
+            del self.track_gallery[track_id]
+
+        if best_id is not None:
+            logger.info(f"ReID: Person {best_id} returned! (similarity={best_sim:.3f})")
+
+        return best_id
+
+    def _save_to_gallery(self, track_id: int, attrs: Dict) -> None:
+        """
+        Save a track's embedding to the gallery before deletion.
+
+        Args:
+            track_id: The track ID being removed
+            attrs: Track attributes including embedding
+        """
+        if not self.USE_REID:
+            return
+
+        embedding = attrs.get('embedding')
+        if embedding is None:
+            return
+
+        self.track_gallery[track_id] = {
+            'embedding': embedding,
+            'last_seen': time.time(),
+            'attributes': attrs.copy()
+        }
+        logger.info(f"ReID: Saved track {track_id} to gallery (gallery size: {len(self.track_gallery)})")
+
+        # Limit gallery size by removing oldest entry
+        if len(self.track_gallery) > self.GALLERY_MAX_SIZE:
+            oldest_id = min(self.track_gallery, key=lambda k: self.track_gallery[k]['last_seen'])
+            del self.track_gallery[oldest_id]
+            logger.debug(f"Gallery full, removed oldest track {oldest_id}")
 
     def update(self, detections: List[Dict]) -> List[TrackedPerson]:
         """
@@ -387,7 +475,8 @@ class KalmanPersonTracker:
                 'confidence': det.get('confidence', det.get('face_confidence', 0.5)),
                 'gender': det.get('gender', 'unknown'),
                 'gender_confidence': det.get('gender_confidence', 0.0),
-                'age': det.get('age', 0.0)
+                'age': det.get('age', 0.0),
+                'embedding': det.get('embedding')  # For ReID
             })
 
         # Predict new locations for existing trackers
@@ -424,22 +513,18 @@ class KalmanPersonTracker:
                     'confidence': det['confidence'],
                     'gender_votes_male': male_votes,
                     'gender_votes_female': female_votes,
+                    'embedding': det.get('embedding'),  # Store embedding for ReID
                 }
             else:
                 attrs = self.track_attributes[track_id]
+                alpha = 0.3  # Smoothing factor for age/confidence
 
-                # Phase 3.2: Apply recency decay to existing votes (so old votes matter less)
-                VOTE_DECAY = 0.95
-                attrs['gender_votes_male'] = attrs.get('gender_votes_male', 0) * VOTE_DECAY
-                attrs['gender_votes_female'] = attrs.get('gender_votes_female', 0) * VOTE_DECAY
-
-                # Phase 3.1: Confidence-weighted gender voting
+                # Majority voting for gender (original logic - more stable)
                 if det['gender'] not in ('unknown', 'Unknown'):
-                    vote_weight = det.get('gender_confidence', 0.5)  # Weight by confidence
                     if det['gender'] in ('male', 'Male'):
-                        attrs['gender_votes_male'] = attrs.get('gender_votes_male', 0) + vote_weight
+                        attrs['gender_votes_male'] = attrs.get('gender_votes_male', 0) + 1
                     else:
-                        attrs['gender_votes_female'] = attrs.get('gender_votes_female', 0) + vote_weight
+                        attrs['gender_votes_female'] = attrs.get('gender_votes_female', 0) + 1
 
                     m = attrs.get('gender_votes_male', 0)
                     f = attrs.get('gender_votes_female', 0)
@@ -448,36 +533,63 @@ class KalmanPersonTracker:
                         attrs['gender'] = 'male' if m >= f else 'female'
                         attrs['gender_confidence'] = max(m, f) / total
 
-                # Phase 3.3: Confidence-adaptive age EMA
-                # Higher confidence -> faster convergence (alpha 0.15-0.40)
                 if det['age'] > 0:
-                    alpha = 0.15 + 0.25 * det.get('gender_confidence', 0.5)  # Range: 0.15-0.40
                     if attrs['age'] > 0:
                         attrs['age'] = alpha * det['age'] + (1 - alpha) * attrs['age']
                     else:
                         attrs['age'] = det['age']
 
-                # Standard EMA for detection confidence
-                conf_alpha = 0.3
-                attrs['confidence'] = conf_alpha * det['confidence'] + (1 - conf_alpha) * attrs['confidence']
+                attrs['confidence'] = alpha * det['confidence'] + (1 - alpha) * attrs['confidence']
 
-        # Create new trackers for unmatched detections
+                # Update embedding with latest (for ReID if track is lost later)
+                if det.get('embedding') is not None:
+                    attrs['embedding'] = det['embedding']
+
+        # Create new trackers for unmatched detections (with ReID check)
         for det_idx in unmatched_detections:
-            new_tracker = KalmanBoxTracker(det_bboxes[det_idx])
+            det = det_data[det_idx]
+            embedding = det.get('embedding')
+
+            # Try to match with gallery for ReID
+            gallery_match_id = self._find_gallery_match(embedding)
+
+            if gallery_match_id is not None:
+                # Resurrect track with original ID
+                new_tracker = KalmanBoxTracker(det_bboxes[det_idx])
+                new_tracker.id = gallery_match_id  # REUSE OLD ID
+                KalmanBoxTracker.count -= 1  # Don't increment counter (was already incremented in __init__)
+
+                # Restore attributes from gallery and update with new detection
+                gallery_data = self.track_gallery.pop(gallery_match_id)
+                restored_attrs = gallery_data['attributes'].copy()
+                # Update with new embedding
+                if embedding is not None:
+                    restored_attrs['embedding'] = embedding
+                self.track_attributes[gallery_match_id] = restored_attrs
+            else:
+                # Create truly new track
+                new_tracker = KalmanBoxTracker(det_bboxes[det_idx])
+
+                male_votes = 1 if det['gender'] in ('male', 'Male') else 0
+                female_votes = 1 if det['gender'] in ('female', 'Female') else 0
+                total_votes = male_votes + female_votes
+                self.track_attributes[new_tracker.id] = {
+                    'gender': det['gender'],
+                    'gender_confidence': max(male_votes, female_votes) / total_votes if total_votes > 0 else 0.0,
+                    'age': det['age'],
+                    'confidence': det['confidence'],
+                    'gender_votes_male': male_votes,
+                    'gender_votes_female': female_votes,
+                    'embedding': embedding,  # Store embedding for ReID
+                }
+
             self.trackers.append(new_tracker)
 
-            det = det_data[det_idx]
-            male_votes = 1 if det['gender'] in ('male', 'Male') else 0
-            female_votes = 1 if det['gender'] in ('female', 'Female') else 0
-            total_votes = male_votes + female_votes
-            self.track_attributes[new_tracker.id] = {
-                'gender': det['gender'],
-                'gender_confidence': max(male_votes, female_votes) / total_votes if total_votes > 0 else 0.0,
-                'age': det['age'],
-                'confidence': det['confidence'],
-                'gender_votes_male': male_votes,
-                'gender_votes_female': female_votes,
-            }
+        # Save to gallery before removing dead trackers (for ReID)
+        for tracker in self.trackers:
+            if tracker.time_since_update > self.max_age:
+                attrs = self.track_attributes.get(tracker.id, {})
+                self._save_to_gallery(tracker.id, attrs)
 
         # Remove dead trackers
         self.trackers = [t for t in self.trackers if t.time_since_update <= self.max_age]
@@ -545,6 +657,7 @@ class KalmanPersonTracker:
         """Reset tracker state."""
         self.trackers.clear()
         self.track_attributes.clear()
+        self.track_gallery.clear()  # Clear ReID gallery
         KalmanBoxTracker.count = 0
         logger.info("Tracker reset")
 

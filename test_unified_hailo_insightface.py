@@ -69,10 +69,8 @@ class UnifiedHailoInsightFacePipeline:
     Complete pipeline: Hailo face detection + InsightFace gender + Kalman tracking.
     """
 
-    # Classification skip settings (Phase 4.2: adaptive interval based on confidence)
-    RECLASS_INTERVAL_MIN = 15       # Minimum frames between reclassification
-    RECLASS_INTERVAL_MAX = 90       # Maximum frames between reclassification
-    RECLASS_INTERVAL = 30           # Default/fallback reclassification interval
+    # Classification skip settings
+    RECLASS_INTERVAL = 30           # Force reclassification every N frames
     GENDER_CONF_THRESHOLD = 0.8     # Min gender confidence to skip reclassification
     SKIP_IOU_THRESHOLD = 0.25       # IoU threshold for pre-matching detections to tracks
 
@@ -143,19 +141,9 @@ class UnifiedHailoInsightFacePipeline:
             return best_id
         return -1
 
-    # Minimum gender votes before skipping is allowed (reduced from 3 for faster skip activation)
-    MIN_GENDER_VOTES = 2
-
-    def _get_adaptive_reclass_interval(self, attrs: Dict) -> int:
-        """
-        Phase 4.2: Compute adaptive reclassification interval based on confidence.
-        Higher confidence -> longer interval (fewer reclassifications).
-        """
-        conf = attrs.get('gender_confidence', 0.5)
-        # Linear interpolation: conf 0.5 -> MIN, conf 1.0 -> MAX
-        t = max(0, min(1, (conf - 0.5) / 0.5))  # Normalize 0.5-1.0 to 0-1
-        interval = int(self.RECLASS_INTERVAL_MIN + t * (self.RECLASS_INTERVAL_MAX - self.RECLASS_INTERVAL_MIN))
-        return interval
+    # Minimum gender votes before skipping is allowed
+    MIN_GENDER_VOTES = 3
+    EMBEDDING_REFRESH_INTERVAL = 60  # Force embedding refresh every N frames for ReID
 
     def _can_skip_classification(self, track_id: int) -> bool:
         """Check if a track has confident enough attributes to skip classification."""
@@ -164,12 +152,15 @@ class UnifiedHailoInsightFacePipeline:
         attrs = self.tracker.track_attributes.get(track_id)
         if attrs is None:
             return False
-
-        # Phase 4.2: Adaptive reclassification interval based on confidence
-        reclass_interval = self._get_adaptive_reclass_interval(attrs)
-        if self._frame_number % reclass_interval == 0:
+        # Force reclassification periodically
+        if self._frame_number % self.RECLASS_INTERVAL == 0:
             return False
-
+        # Force classification if no embedding (needed for ReID)
+        if attrs.get('embedding') is None:
+            return False
+        # Periodically refresh embedding for ReID accuracy
+        if self._frame_number % self.EMBEDDING_REFRESH_INTERVAL == 0:
+            return False
         # Require minimum number of votes so early 1/1 = 100% doesn't skip prematurely
         total_votes = attrs.get('gender_votes_male', 0) + attrs.get('gender_votes_female', 0)
         if total_votes < self.MIN_GENDER_VOTES:
@@ -225,7 +216,8 @@ class UnifiedHailoInsightFacePipeline:
                     'confidence': face['confidence'],
                     'gender': attrs['gender'],
                     'gender_confidence': attrs['gender_confidence'],
-                    'age': attrs['age']
+                    'age': attrs['age'],
+                    'embedding': attrs.get('embedding')  # CRITICAL: Pass embedding for ReID
                 }
                 skipped_detections.append((idx, detection))
                 skipped += 1
@@ -250,7 +242,8 @@ class UnifiedHailoInsightFacePipeline:
                     'confidence': face_data['confidence'],
                     'gender': result.gender.lower(),
                     'gender_confidence': result.gender_confidence,
-                    'age': result.raw_age if result.raw_age is not None else result.age_midpoint
+                    'age': result.raw_age if result.raw_age is not None else result.age_midpoint,
+                    'embedding': result.embedding  # For ReID
                 }
                 detections.append((idx, detection))
 
@@ -402,16 +395,16 @@ Examples:
     # Detection parameters
     parser.add_argument('--hailo-model', type=str, default=None,
                         help='Path to Hailo face detection HEF')
-    parser.add_argument('--face-conf', type=float, default=0.5,
-                        help='Face detection confidence threshold')
+    parser.add_argument('--face-conf', type=float, default=0.4,
+                        help='Face detection confidence threshold (lowered for better recall)')
     parser.add_argument('--insightface-model', type=str, default='buffalo_l',
                         help='InsightFace model pack: buffalo_l (accurate) or buffalo_s (fast)')
 
     # Tracking parameters
     parser.add_argument('--max-age', type=int, default=30,
                         help='Max frames to keep track without detection')
-    parser.add_argument('--min-hits', type=int, default=3,
-                        help='Min detections to confirm track')
+    parser.add_argument('--min-hits', type=int, default=4,
+                        help='Min detections to confirm track (increased to reduce false positives)')
     parser.add_argument('--iou-threshold', type=float, default=0.25,
                         help='Min IoU for track association')
 

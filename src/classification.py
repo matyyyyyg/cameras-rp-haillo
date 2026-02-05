@@ -1,14 +1,3 @@
-"""
-Age and Gender Classification Module
-
-This module provides age and gender estimation using multiple backends:
-1. InsightFace (recommended) - State-of-the-art accuracy with continuous age prediction
-2. OpenCV DNN with Caffe models - Fallback option
-
-<
-Created: 2024
-"""
-
 from typing import Dict, Tuple, Optional, List
 from pathlib import Path
 from dataclasses import dataclass
@@ -75,6 +64,7 @@ class ClassificationResult:
         gender: Predicted gender ("Male" or "Female")
         gender_confidence: Confidence score for gender prediction (0-1)
         raw_age: Raw continuous age prediction (if available)
+        embedding: 512-dim face embedding for ReID (if available)
     """
     age_bucket: str
     age_midpoint: float  # Changed to float for decimal precision
@@ -82,6 +72,7 @@ class ClassificationResult:
     gender: str
     gender_confidence: float
     raw_age: Optional[float] = None
+    embedding: Optional[np.ndarray] = None  # 512-dim face embedding for ReID
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for logging/serialization."""
@@ -131,11 +122,11 @@ class InsightFaceClassifier:
         try:
             from insightface.app import FaceAnalysis
 
-            # Initialize FaceAnalysis with age/gender models
+            # Initialize FaceAnalysis with age/gender models + recognition for ReID
             self._app = FaceAnalysis(
                 name=model_name,
                 providers=['CPUExecutionProvider'],
-                allowed_modules=['detection', 'genderage']
+                allowed_modules=['detection', 'genderage', 'recognition']
             )
             # 320x320 is sufficient since Hailo already detected the face;
             # InsightFace only needs to locate it in a small padded crop
@@ -267,13 +258,19 @@ class InsightFaceClassifier:
                 # Try Caffe fallback by returning None
                 return None
 
+            # Extract face embedding for ReID (512-dim L2-normalized vector)
+            embedding = None
+            if hasattr(face, 'normed_embedding') and face.normed_embedding is not None:
+                embedding = face.normed_embedding
+
             return ClassificationResult(
                 age_bucket=age_bucket,
                 age_midpoint=round(raw_age, 1),
                 age_confidence=0.90,  # Higher confidence for optimized settings
                 gender=final_gender,
                 gender_confidence=gender_conf,
-                raw_age=raw_age
+                raw_age=raw_age,
+                embedding=embedding
             )
 
         except Exception as e:
@@ -488,15 +485,14 @@ class AgeGenderClassifier:
                         )
                 elif self._caffe_loaded:
                     # Ensemble: combine InsightFace + Caffe gender predictions
-                    # Dynamic confidence based on agreement (Phase 2.3)
                     try:
                         caffe_gender, caffe_conf = self._predict_gender_caffe(face_crop)
                         if caffe_gender.lower() == result.gender.lower():
-                            # Both agree - high confidence (0.92)
-                            gender_conf = 0.92
+                            # Both agree - boost confidence
+                            gender_conf = min(0.95, result.gender_confidence + 0.10)
                         else:
-                            # Disagree - lower confidence (0.70)
-                            gender_conf = 0.70
+                            # Disagree - keep InsightFace but lower confidence
+                            gender_conf = max(0.50, result.gender_confidence - 0.15)
                         result = ClassificationResult(
                             age_bucket=result.age_bucket,
                             age_midpoint=result.age_midpoint,
@@ -560,7 +556,8 @@ class AgeGenderClassifier:
 
 
 # Feature flag for face alignment (Phase 4.1)
-USE_FACE_ALIGNMENT = True
+# Disabled by default - enable only if Hailo provides accurate 5-point landmarks
+USE_FACE_ALIGNMENT = False
 
 # Reference landmarks for alignment (ArcFace standard - 112x112 output)
 REFERENCE_LANDMARKS = np.array([
@@ -680,3 +677,4 @@ def extract_face_crop(
         face_crop = cv2.resize(face_crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
     return face_crop
+    
