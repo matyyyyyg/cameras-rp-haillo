@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""
-Hailo face detection + InsightFace gender classification with Kalman Tracking.
-Outputs detections in client JSON format with persistent person IDs.
-
-Requires Raspberry Pi 5 with Hailo-8 accelerator.
-
-Output format:
-{
-    "sensor_id": "XXXXXXXXXXXXX",
-    "timestamp": "2025-12-10 14:35:12.123456",
-    "detections": [
-        {"id": 1, "age": 28.4, "gender": "male", "confidence": 0.95, "bbox": {...}}
-    ]
-}
-"""
-
 import cv2
 import numpy as np
 import logging
@@ -85,8 +69,10 @@ class UnifiedHailoInsightFacePipeline:
     Complete pipeline: Hailo face detection + InsightFace gender + Kalman tracking.
     """
 
-    # Classification skip settings
-    RECLASS_INTERVAL = 30           # Force reclassification every N frames
+    # Classification skip settings (Phase 4.2: adaptive interval based on confidence)
+    RECLASS_INTERVAL_MIN = 15       # Minimum frames between reclassification
+    RECLASS_INTERVAL_MAX = 90       # Maximum frames between reclassification
+    RECLASS_INTERVAL = 30           # Default/fallback reclassification interval
     GENDER_CONF_THRESHOLD = 0.8     # Min gender confidence to skip reclassification
     SKIP_IOU_THRESHOLD = 0.25       # IoU threshold for pre-matching detections to tracks
 
@@ -157,8 +143,19 @@ class UnifiedHailoInsightFacePipeline:
             return best_id
         return -1
 
-    # Minimum gender votes before skipping is allowed
-    MIN_GENDER_VOTES = 3
+    # Minimum gender votes before skipping is allowed (reduced from 3 for faster skip activation)
+    MIN_GENDER_VOTES = 2
+
+    def _get_adaptive_reclass_interval(self, attrs: Dict) -> int:
+        """
+        Phase 4.2: Compute adaptive reclassification interval based on confidence.
+        Higher confidence -> longer interval (fewer reclassifications).
+        """
+        conf = attrs.get('gender_confidence', 0.5)
+        # Linear interpolation: conf 0.5 -> MIN, conf 1.0 -> MAX
+        t = max(0, min(1, (conf - 0.5) / 0.5))  # Normalize 0.5-1.0 to 0-1
+        interval = int(self.RECLASS_INTERVAL_MIN + t * (self.RECLASS_INTERVAL_MAX - self.RECLASS_INTERVAL_MIN))
+        return interval
 
     def _can_skip_classification(self, track_id: int) -> bool:
         """Check if a track has confident enough attributes to skip classification."""
@@ -167,9 +164,12 @@ class UnifiedHailoInsightFacePipeline:
         attrs = self.tracker.track_attributes.get(track_id)
         if attrs is None:
             return False
-        # Force reclassification periodically
-        if self._frame_number % self.RECLASS_INTERVAL == 0:
+
+        # Phase 4.2: Adaptive reclassification interval based on confidence
+        reclass_interval = self._get_adaptive_reclass_interval(attrs)
+        if self._frame_number % reclass_interval == 0:
             return False
+
         # Require minimum number of votes so early 1/1 = 100% doesn't skip prematurely
         total_votes = attrs.get('gender_votes_male', 0) + attrs.get('gender_votes_female', 0)
         if total_votes < self.MIN_GENDER_VOTES:
@@ -185,6 +185,7 @@ class UnifiedHailoInsightFacePipeline:
 
         Skips InsightFace classification for detections that match existing tracks
         with confident attributes, reclassifying every RECLASS_INTERVAL frames.
+        Uses batch classification for efficiency when multiple faces need classification.
 
         Args:
             frame: Input frame (BGR)
@@ -199,12 +200,16 @@ class UnifiedHailoInsightFacePipeline:
         faces = self.face_detector.detect_faces(frame)
         t1 = time.time()
 
-        # --- Stage 2: Classify gender + age (with skip logic) ---
+        # --- Stage 2: Classify gender + age (with skip logic + batch processing) ---
         detections = []
         skipped = 0
         total = len(faces)
 
-        for face in faces:
+        # Collect faces needing classification for batch processing
+        faces_to_classify = []  # List of (index, face_crop, face_data)
+        skipped_detections = []  # List of (index, detection)
+
+        for idx, face in enumerate(faces):
             x, y, w, h = face['box']
             bbox = (x, y, x + w, y + h)
 
@@ -222,23 +227,37 @@ class UnifiedHailoInsightFacePipeline:
                     'gender_confidence': attrs['gender_confidence'],
                     'age': attrs['age']
                 }
+                skipped_detections.append((idx, detection))
                 skipped += 1
             else:
-                # Run full classification
-                face_crop = extract_face_crop(frame, bbox)
+                # Collect for batch classification
+                # Phase 4.1: Pass landmarks to extract_face_crop for alignment
+                landmarks = face.get('landmarks')  # Hailo may provide 5-point landmarks
+                face_crop = extract_face_crop(frame, bbox, landmarks=landmarks)
                 if face_crop.size == 0:
                     continue
-                result = self.classifier.classify(face_crop)
+                faces_to_classify.append((idx, face_crop, {'box': (x, y, w, h), 'bbox': bbox, 'confidence': face['confidence']}))
+
+        # Batch classify all faces that need classification
+        if faces_to_classify:
+            face_crops = [item[1] for item in faces_to_classify]
+            results = self.classifier.classify_batch(face_crops)
+
+            for (idx, _, face_data), result in zip(faces_to_classify, results):
                 detection = {
-                    'box': (x, y, w, h),
-                    'bbox': bbox,
-                    'confidence': face['confidence'],
+                    'box': face_data['box'],
+                    'bbox': face_data['bbox'],
+                    'confidence': face_data['confidence'],
                     'gender': result.gender.lower(),
                     'gender_confidence': result.gender_confidence,
                     'age': result.raw_age if result.raw_age is not None else result.age_midpoint
                 }
+                detections.append((idx, detection))
 
-            detections.append(detection)
+        # Combine and sort by original index to maintain order
+        all_detections = skipped_detections + detections
+        all_detections.sort(key=lambda x: x[0])
+        detections = [d[1] for d in all_detections]
 
         t2 = time.time()
 
@@ -359,7 +378,6 @@ class JSONLogger:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hailo + InsightFace Gender Detection with Kalman Tracking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

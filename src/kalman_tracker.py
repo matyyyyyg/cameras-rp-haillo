@@ -427,14 +427,19 @@ class KalmanPersonTracker:
                 }
             else:
                 attrs = self.track_attributes[track_id]
-                alpha = 0.3  # Smoothing factor for age/confidence
 
-                # Majority voting for gender
+                # Phase 3.2: Apply recency decay to existing votes (so old votes matter less)
+                VOTE_DECAY = 0.95
+                attrs['gender_votes_male'] = attrs.get('gender_votes_male', 0) * VOTE_DECAY
+                attrs['gender_votes_female'] = attrs.get('gender_votes_female', 0) * VOTE_DECAY
+
+                # Phase 3.1: Confidence-weighted gender voting
                 if det['gender'] not in ('unknown', 'Unknown'):
+                    vote_weight = det.get('gender_confidence', 0.5)  # Weight by confidence
                     if det['gender'] in ('male', 'Male'):
-                        attrs['gender_votes_male'] = attrs.get('gender_votes_male', 0) + 1
+                        attrs['gender_votes_male'] = attrs.get('gender_votes_male', 0) + vote_weight
                     else:
-                        attrs['gender_votes_female'] = attrs.get('gender_votes_female', 0) + 1
+                        attrs['gender_votes_female'] = attrs.get('gender_votes_female', 0) + vote_weight
 
                     m = attrs.get('gender_votes_male', 0)
                     f = attrs.get('gender_votes_female', 0)
@@ -443,13 +448,18 @@ class KalmanPersonTracker:
                         attrs['gender'] = 'male' if m >= f else 'female'
                         attrs['gender_confidence'] = max(m, f) / total
 
+                # Phase 3.3: Confidence-adaptive age EMA
+                # Higher confidence -> faster convergence (alpha 0.15-0.40)
                 if det['age'] > 0:
+                    alpha = 0.15 + 0.25 * det.get('gender_confidence', 0.5)  # Range: 0.15-0.40
                     if attrs['age'] > 0:
                         attrs['age'] = alpha * det['age'] + (1 - alpha) * attrs['age']
                     else:
                         attrs['age'] = det['age']
 
-                attrs['confidence'] = alpha * det['confidence'] + (1 - alpha) * attrs['confidence']
+                # Standard EMA for detection confidence
+                conf_alpha = 0.3
+                attrs['confidence'] = conf_alpha * det['confidence'] + (1 - conf_alpha) * attrs['confidence']
 
         # Create new trackers for unmatched detections
         for det_idx in unmatched_detections:
