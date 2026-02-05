@@ -55,12 +55,19 @@ class UnifiedHailoFaceDetector:
     - SCRFD: 40+ FPS (faster, good for real-time)
     """
 
+    # Minimum face size in pixels (width and height)
+    MIN_FACE_SIZE = 20  # Lowered from 40 to detect smaller/distant faces
+    # Valid aspect ratio range for faces (width/height)
+    MIN_ASPECT_RATIO = 0.4  # More tolerant for angled faces
+    MAX_ASPECT_RATIO = 2.5  # More tolerant for angled faces
+
     def __init__(
         self,
         model_path: Optional[str] = None,
-        confidence_threshold: float = 0.5,
+        confidence_threshold: float = 0.4,  # Lowered for better recall
         nms_threshold: float = 0.4,
-        device_id: str = "0"
+        device_id: str = "0",
+        min_face_size: int = 20  # Minimum face size in pixels (lowered)
     ):
         """
         Initialize Hailo face detector.
@@ -71,10 +78,12 @@ class UnifiedHailoFaceDetector:
             confidence_threshold: Minimum confidence (0.0-1.0)
             nms_threshold: NMS threshold for overlapping boxes
             device_id: Hailo device ID (usually "0")
+            min_face_size: Minimum face width/height in pixels
         """
         self.confidence_threshold = confidence_threshold
         self.nms_threshold = nms_threshold
         self.device_id = device_id
+        self.min_face_size = min_face_size
 
         # Resolve model path
         project_root = Path(__file__).parent.parent
@@ -377,8 +386,12 @@ class UnifiedHailoFaceDetector:
                     # --- Score extraction ---
                     if is_scrfd:
                         # SCRFD: 1 class per anchor
-                        # Hailo HEF outputs are already sigmoid-activated
-                        scores = cls_data[:, :, anchor_idx]
+                        raw_scores = cls_data[:, :, anchor_idx]
+                        # Apply sigmoid if scores look like raw logits (range outside 0-1)
+                        if raw_scores.max() > 1.0 or raw_scores.min() < 0.0:
+                            scores = 1.0 / (1.0 + np.exp(-raw_scores))
+                        else:
+                            scores = raw_scores
                     else:
                         # RetinaFace: 2 classes per anchor, softmax activation
                         bg = cls_data[:, :, anchor_idx * 2]
@@ -479,11 +492,24 @@ class UnifiedHailoFaceDetector:
             keep = self._nms(all_boxes, all_scores, self.nms_threshold)
 
             detections = []
+            filtered_count = 0
             for i in keep:
                 x1, y1, x2, y2 = all_boxes[i]
                 x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
                 if w <= 0 or h <= 0:
                     continue
+
+                # Filter by minimum face size
+                if w < self.min_face_size or h < self.min_face_size:
+                    filtered_count += 1
+                    continue
+
+                # Filter by aspect ratio (reject very wide or very tall boxes)
+                aspect_ratio = w / max(h, 1)
+                if aspect_ratio < self.MIN_ASPECT_RATIO or aspect_ratio > self.MAX_ASPECT_RATIO:
+                    filtered_count += 1
+                    continue
+
                 det = {
                     'box': (x, y, w, h),
                     'confidence': float(all_scores[i])
@@ -492,6 +518,13 @@ class UnifiedHailoFaceDetector:
                     lm = all_landmarks[i]
                     det['landmarks'] = [(int(lm[j]), int(lm[j+1])) for j in range(0, 10, 2)]
                 detections.append(det)
+
+            if filtered_count > 0:
+                logger.debug(f"Filtered {filtered_count} detections (size/aspect ratio)")
+
+            # Log detection summary periodically
+            if len(detections) == 0 and len(all_scores) > 0:
+                logger.debug(f"No detections passed filters (pre-NMS: {len(all_scores)}, post-NMS: {len(keep)}, filtered: {filtered_count})")
 
             return detections
 
@@ -573,7 +606,7 @@ class UnifiedHailoFaceDetector:
 # Convenience function
 def create_hailo_face_detector(
     model_path: Optional[str] = None,
-    confidence: float = 0.5
+    confidence: float = 0.4  # Lowered for better recall
 ) -> UnifiedHailoFaceDetector:
     """
     Create a Hailo face detector instance.
