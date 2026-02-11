@@ -57,17 +57,7 @@ python test_unified_hailo_insightface.py [options]
 1. **Face Detection** - Hailo-8 runs RetinaFace model (~30 FPS)
 2. **Classification** - InsightFace extracts gender, age, and face embedding
 3. **Tracking** - Kalman filter tracks faces across frames
-4. **ReID** - When someone leaves and returns, they get the same ID back
 
-## ReID (Re-Identification)
-
-The system remembers people for 10 minutes after they leave the frame. When they come back, it matches their face embedding and gives them the same ID.
-
-Settings in `src/kalman_tracker.py`:
-```python
-REID_SIMILARITY_THRESHOLD = 0.4   # How similar faces need to be (0-1)
-GALLERY_MAX_AGE_SECONDS = 600     # Remember for 10 minutes
-```
 
 ## Output Example
 
@@ -126,5 +116,4 @@ Face detection Raspberry/
 - HailoRT (for Raspberry Pi)
 
 ---
-
-Made for university project - face analytics on edge devices.
+Matyas Prokopius
