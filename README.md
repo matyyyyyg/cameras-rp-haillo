@@ -125,6 +125,3 @@ Face detection Raspberry/
 - InsightFace
 - HailoRT (for Raspberry Pi)
 
----
-
-Made for university project - face analytics on edge devices.
