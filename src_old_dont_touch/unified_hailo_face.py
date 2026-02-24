@@ -1,8 +1,3 @@
-"""
-Hailo-8 hardware accelerated face detector.
-Supports RetinaFace and SCRFD models on Raspberry Pi 5.
-"""
-
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 import logging
@@ -42,21 +37,9 @@ def is_hailo_available() -> bool:
 
 
 class UnifiedHailoFaceDetector:
-    """
-    Unified face detector using Hailo-8 hardware acceleration.
-
-    This detector:
-    1. Uses RetinaFace or SCRFD on Hailo-8 for face detection
-    2. Returns bounding boxes of detected faces
-    3. Can be paired with ANY gender classifier for fair comparison
-
-    Typical Performance (Raspberry Pi 5 + Hailo-8):
-    - RetinaFace: 25-30 FPS (best accuracy for CCTV)
-    - SCRFD: 40+ FPS (faster, good for real-time)
-    """
-
+  
     # Minimum face size in pixels (width and height)
-    MIN_FACE_SIZE = 20  # Lowered from 40 to detect smaller/distant faces
+    MIN_FACE_SIZE = 30  # Lowered from 40 to detect smaller/distant faces
     # Valid aspect ratio range for faces (width/height)
     MIN_ASPECT_RATIO = 0.4  # More tolerant for angled faces
     MAX_ASPECT_RATIO = 2.5  # More tolerant for angled faces

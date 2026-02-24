@@ -48,13 +48,13 @@ class PiCameraCapture:
             self._opened = False
 
 # Import Hailo face detector (auto-detects RetinaFace vs SCRFD)
-from src.unified_hailo_face import UnifiedHailoFaceDetector, is_hailo_available
+from src_old_dont_touch.unified_hailo_face import UnifiedHailoFaceDetector, is_hailo_available
 
 # Import Kalman tracker
-from src.kalman_tracker import KalmanPersonTracker, format_output_json, TrackedPerson, calculate_iou
+from src_old_dont_touch.kalman_tracker import KalmanPersonTracker, format_output_json, TrackedPerson, calculate_iou
 
 # Import ensemble classifier (InsightFace + Caffe)
-from src.classification import AgeGenderClassifier, extract_face_crop
+from src_old_dont_touch.classification import AgeGenderClassifier, extract_face_crop
 
 # Configure logging
 logging.basicConfig(
@@ -70,7 +70,7 @@ class UnifiedHailoInsightFacePipeline:
     """
 
     # Classification skip settings
-    RECLASS_INTERVAL = 30           # Force reclassification every N frames
+    RECLASS_INTERVAL = 90           # Force reclassification every N frames
     GENDER_CONF_THRESHOLD = 0.8     # Min gender confidence to skip reclassification
     SKIP_IOU_THRESHOLD = 0.25       # IoU threshold for pre-matching detections to tracks
 
@@ -80,9 +80,9 @@ class UnifiedHailoInsightFacePipeline:
         hailo_model_path: str = None,
         face_confidence: float = 0.5,
         insightface_model: str = 'buffalo_l',
-        max_age: int = 30,
+        max_age: int = 60,
         min_hits: int = 3,
-        iou_threshold: float = 0.25
+        iou_threshold: float = 0.15
     ):
         """Initialize pipeline with tracking."""
         logger.info("Initializing Unified Hailo + InsightFace Ensemble + Tracking Pipeline...")
@@ -142,8 +142,7 @@ class UnifiedHailoInsightFacePipeline:
         return -1
 
     # Minimum gender votes before skipping is allowed
-    MIN_GENDER_VOTES = 3
-    EMBEDDING_REFRESH_INTERVAL = 60  # Force embedding refresh every N frames for ReID
+    MIN_GENDER_VOTES = 2
 
     def _can_skip_classification(self, track_id: int) -> bool:
         """Check if a track has confident enough attributes to skip classification."""
@@ -154,12 +153,6 @@ class UnifiedHailoInsightFacePipeline:
             return False
         # Force reclassification periodically
         if self._frame_number % self.RECLASS_INTERVAL == 0:
-            return False
-        # Force classification if no embedding (needed for ReID)
-        if attrs.get('embedding') is None:
-            return False
-        # Periodically refresh embedding for ReID accuracy
-        if self._frame_number % self.EMBEDDING_REFRESH_INTERVAL == 0:
             return False
         # Require minimum number of votes so early 1/1 = 100% doesn't skip prematurely
         total_votes = attrs.get('gender_votes_male', 0) + attrs.get('gender_votes_female', 0)
@@ -176,7 +169,6 @@ class UnifiedHailoInsightFacePipeline:
 
         Skips InsightFace classification for detections that match existing tracks
         with confident attributes, reclassifying every RECLASS_INTERVAL frames.
-        Uses batch classification for efficiency when multiple faces need classification.
 
         Args:
             frame: Input frame (BGR)
@@ -191,16 +183,12 @@ class UnifiedHailoInsightFacePipeline:
         faces = self.face_detector.detect_faces(frame)
         t1 = time.time()
 
-        # --- Stage 2: Classify gender + age (with skip logic + batch processing) ---
+        # --- Stage 2: Classify gender + age (with skip logic) ---
         detections = []
         skipped = 0
         total = len(faces)
 
-        # Collect faces needing classification for batch processing
-        faces_to_classify = []  # List of (index, face_crop, face_data)
-        skipped_detections = []  # List of (index, detection)
-
-        for idx, face in enumerate(faces):
+        for face in faces:
             x, y, w, h = face['box']
             bbox = (x, y, x + w, y + h)
 
@@ -217,40 +205,25 @@ class UnifiedHailoInsightFacePipeline:
                     'gender': attrs['gender'],
                     'gender_confidence': attrs['gender_confidence'],
                     'age': attrs['age'],
-                    'embedding': attrs.get('embedding')  # CRITICAL: Pass embedding for ReID
+                    'age_skipped': True,
                 }
-                skipped_detections.append((idx, detection))
                 skipped += 1
             else:
-                # Collect for batch classification
-                # Phase 4.1: Pass landmarks to extract_face_crop for alignment
-                landmarks = face.get('landmarks')  # Hailo may provide 5-point landmarks
-                face_crop = extract_face_crop(frame, bbox, landmarks=landmarks)
+                # Run full classification
+                face_crop = extract_face_crop(frame, bbox)
                 if face_crop.size == 0:
                     continue
-                faces_to_classify.append((idx, face_crop, {'box': (x, y, w, h), 'bbox': bbox, 'confidence': face['confidence']}))
-
-        # Batch classify all faces that need classification
-        if faces_to_classify:
-            face_crops = [item[1] for item in faces_to_classify]
-            results = self.classifier.classify_batch(face_crops)
-
-            for (idx, _, face_data), result in zip(faces_to_classify, results):
+                result = self.classifier.classify(face_crop)
                 detection = {
-                    'box': face_data['box'],
-                    'bbox': face_data['bbox'],
-                    'confidence': face_data['confidence'],
+                    'box': (x, y, w, h),
+                    'bbox': bbox,
+                    'confidence': face['confidence'],
                     'gender': result.gender.lower(),
                     'gender_confidence': result.gender_confidence,
-                    'age': result.raw_age if result.raw_age is not None else result.age_midpoint,
-                    'embedding': result.embedding  # For ReID
+                    'age': result.raw_age if result.raw_age is not None else result.age_midpoint
                 }
-                detections.append((idx, detection))
 
-        # Combine and sort by original index to maintain order
-        all_detections = skipped_detections + detections
-        all_detections.sort(key=lambda x: x[0])
-        detections = [d[1] for d in all_detections]
+            detections.append(detection)
 
         t2 = time.time()
 
@@ -371,6 +344,7 @@ class JSONLogger:
 
 def main():
     parser = argparse.ArgumentParser(
+        description="Hailo + InsightFace Gender Detection with Kalman Tracking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -395,17 +369,17 @@ Examples:
     # Detection parameters
     parser.add_argument('--hailo-model', type=str, default=None,
                         help='Path to Hailo face detection HEF')
-    parser.add_argument('--face-conf', type=float, default=0.4,
-                        help='Face detection confidence threshold (lowered for better recall)')
+    parser.add_argument('--face-conf', type=float, default=0.5,
+                        help='Face detection confidence threshold')
     parser.add_argument('--insightface-model', type=str, default='buffalo_l',
                         help='InsightFace model pack: buffalo_l (accurate) or buffalo_s (fast)')
 
     # Tracking parameters
-    parser.add_argument('--max-age', type=int, default=30,
+    parser.add_argument('--max-age', type=int, default=60,
                         help='Max frames to keep track without detection')
-    parser.add_argument('--min-hits', type=int, default=4,
-                        help='Min detections to confirm track (increased to reduce false positives)')
-    parser.add_argument('--iou-threshold', type=float, default=0.25,
+    parser.add_argument('--min-hits', type=int, default=3,
+                        help='Min detections to confirm track')
+    parser.add_argument('--iou-threshold', type=float, default=0.15,
                         help='Min IoU for track association')
 
     # Logging frequency
