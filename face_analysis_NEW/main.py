@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class PiCameraCapture:
     """Wrapper around Picamera2 that mimics cv2.VideoCapture interface."""
 
-    def __init__(self, width=640, height=480, framerate=30):
+    def __init__(self, width=1280, height=960, framerate=30):
         from picamera2 import Picamera2
         self._picam = Picamera2()
         config = self._picam.create_preview_configuration(
@@ -37,6 +37,9 @@ class PiCameraCapture:
         self._picam.configure(config)
         self._picam.start()
         self._opened = True
+        self._width = width
+        self._height = height
+        self._framerate = framerate
 
     def isOpened(self):
         return self._opened
@@ -49,11 +52,11 @@ class PiCameraCapture:
 
     def get(self, prop):
         if prop == cv2.CAP_PROP_FPS:
-            return 30
+            return self._framerate
         if prop == cv2.CAP_PROP_FRAME_WIDTH:
-            return 640
+            return self._width
         if prop == cv2.CAP_PROP_FRAME_HEIGHT:
-            return 480
+            return self._height
         return 0
 
     def release(self):
@@ -353,6 +356,10 @@ Examples:
     parser.add_argument('--min-confidence', type=float, default=0.5,
                         help='Minimum confidence to log detection (default: 0.5)')
 
+    # Camera resolution
+    parser.add_argument('--resolution', type=str, default='1280x960',
+                        help='Camera resolution as WxH (default: 1280x960)')
+
     # Display
     parser.add_argument('--display', action='store_true',
                         help='Display output video window')
@@ -366,6 +373,13 @@ Examples:
                         help='Save snapshot every N seconds (default: 60)')
 
     args = parser.parse_args()
+
+    # Parse resolution
+    try:
+        res_w, res_h = (int(v) for v in args.resolution.split('x'))
+    except ValueError:
+        logger.error(f"Invalid resolution format '{args.resolution}', expected WxH (e.g. 1280x960)")
+        return 1
 
     # Check Hailo availability
     if not is_hailo_available():
@@ -397,8 +411,8 @@ Examples:
     # Open input source
     if args.input == 'camera':
         try:
-            cap = PiCameraCapture(width=640, height=480, framerate=30)
-            logger.info("Using Pi Camera via Picamera2")
+            cap = PiCameraCapture(width=res_w, height=res_h, framerate=30)
+            logger.info(f"Using Pi Camera via Picamera2 ({res_w}x{res_h})")
         except Exception as e:
             logger.warning(f"Picamera2 not available ({e}), trying OpenCV...")
             cap = cv2.VideoCapture(0)
