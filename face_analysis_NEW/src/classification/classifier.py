@@ -9,12 +9,12 @@ from ..utils.face_crop import apply_conditional_clahe
 
 logger = logging.getLogger(__name__)
 
-# VGGFace2 mean subtraction (BGR order, raw 0-255 pixel space)
-VGGFACE2_MEAN = np.array([103.939, 116.779, 123.68], dtype=np.float32)
+# Mean subtraction applied AFTER BGR→RGB conversion (matches facial_analysis.py)
+CHANNEL_MEAN = np.array([103.939, 116.779, 123.68], dtype=np.float32)
 
 # HSE model constants
-MIN_AGE = 1       # Model classes represent ages MIN_AGE .. MIN_AGE+N-1
-MALE_THRESHOLD = 0.6  # Sigmoid value >= this → male
+MIN_AGE = 1           # Model classes represent ages MIN_AGE .. MIN_AGE+N-1
+MALE_THRESHOLD = 0.6  # Sigmoid value >= this → male (from is_male() in source)
 
 
 class AgeGenderClassifier:
@@ -24,9 +24,14 @@ class AgeGenderClassifier:
         """
         Initialize the HSE MobileNet ONNX age/gender classifier.
 
-        The model expects 224x224 BGR input with VGGFace2 mean subtraction and
-        produces two heads:
-          - age_pred/Softmax  : softmax over ~101 age classes (ages 1-101)
+        Preprocessing (from av-savchenko/HSE_FaceRec_tf facial_analysis.py):
+          1. Resize to 224x224
+          2. BGR → RGB
+          3. Subtract [103.939, 116.779, 123.68] per channel
+          4. NHWC batch dimension
+
+        Outputs:
+          - age_pred/Softmax  : softmax over 101 age classes (ages 1-101)
           - gender_pred/Sigmoid: single sigmoid (>=0.6 → male)
 
         Args:
@@ -57,21 +62,27 @@ class AgeGenderClassifier:
 
         self._input_name = self.session.get_inputs()[0].name
         self._output_names = [o.name for o in self.session.get_outputs()]
+        self._first_run = True
 
         logger.info(f"AgeGenderClassifier loaded: {self.model_path.name}")
         logger.info(f"   Input: {self._input_name}")
         logger.info(f"   Outputs: {self._output_names}")
 
     def _preprocess(self, face_crop: np.ndarray) -> np.ndarray:
-        """Preprocess a BGR face crop for the HSE MobileNet model."""
+        """Preprocess a BGR face crop matching facial_analysis.py exactly."""
         img = apply_conditional_clahe(face_crop)
         img = cv2.resize(img, self.INPUT_SIZE)
 
-        # Keep BGR, raw 0-255 range, subtract VGGFace2 mean
-        img = img.astype(np.float32) - VGGFACE2_MEAN
+        # BGR → RGB (as in source: x = x[..., ::-1])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # HWC -> CHW -> NCHW
-        img = np.transpose(img, (2, 0, 1))
+        # Subtract channel means on RGB (raw 0-255, no /255 scaling)
+        img = img.astype(np.float32)
+        img[..., 0] -= CHANNEL_MEAN[0]  # 103.939
+        img[..., 1] -= CHANNEL_MEAN[1]  # 116.779
+        img[..., 2] -= CHANNEL_MEAN[2]  # 123.68
+
+        # NHWC (TF convention, kept by tf2onnx conversion)
         img = np.expand_dims(img, axis=0)
 
         return img
@@ -112,6 +123,13 @@ class AgeGenderClassifier:
                 f"Unexpected output shapes: {[o.shape for o in outputs]}"
             )
 
+        # Debug: log raw outputs on first run
+        if self._first_run:
+            self._first_run = False
+            logger.info(f"DEBUG age_probs shape={age_probs.shape}, top5={age_probs[np.argsort(age_probs)[-5:]]}")
+            logger.info(f"DEBUG top5 indices={np.argsort(age_probs)[-5:]}")
+            logger.info(f"DEBUG gender_val={gender_val:.4f}")
+
         # --- Age: weighted average of top-2 softmax classes ---
         top2_idx = np.argsort(age_probs)[-2:]
         top2_probs = age_probs[top2_idx]
@@ -119,7 +137,7 @@ class AgeGenderClassifier:
         age = float(np.sum((top2_idx + MIN_AGE) * top2_probs))
         age = max(0.0, min(age, 100.0))
 
-        # --- Gender: sigmoid value, threshold at MALE_THRESHOLD ---
+        # --- Gender: sigmoid >= 0.6 → male (from source is_male()) ---
         if gender_val >= MALE_THRESHOLD:
             gender = "male"
             gender_confidence = float(gender_val)
