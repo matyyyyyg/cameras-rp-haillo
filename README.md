@@ -4,70 +4,80 @@ A real-time face detection system with gender/age classification and person trac
 
 ## What it does
 
-- Detects faces in video/camera feed
-- Estimates gender and age
-- Tracks people across frames (same person keeps same ID)
-- Re-identifies people when they leave and come back (ReID feature)
+- Detects faces in video/camera feed using Hailo-8 hardware acceleration
+- Estimates gender and age using ONNX MobileNet model
+- Tracks people across frames with Kalman filter (same person keeps same ID)
+- Quality gate filters out blurry, dark, or tiny faces
+- Outputs structured JSON for downstream analytics
 
 ## Hardware
 
 - Raspberry Pi 5
 - Hailo-8 AI HAT (for fast face detection)
-- Camera or video file
+- Pi Camera or USB camera (or video file)
 
 ## Quick Setup
 
 ```bash
+cd face_analysis_NEW
+
 # Install dependencies
 pip install -r requirements.txt
 
-# Download the Hailo face detection model
-bash download_hailo_models.sh
+# Download age/gender ONNX model
+bash scripts/download_models.sh
 
-# Run with camera
-python test_unified_hailo_insightface.py --display
+# Run with Pi Camera
+python main.py --display
 
 # Run with video file
-python test_unified_hailo_insightface.py --input video.mp4 --display
+python main.py --input video.mp4 --display
+
+# Run with custom confidence and logging
+python main.py --display --face-conf 0.3 --log detections.jsonl
+
+# Save annotated video + periodic snapshots
+python main.py --display --output-video out.mp4 --snapshot-dir snapshots/
 ```
 
 ## Main Files
 
 | File | What it does |
 |------|--------------|
-| `test_unified_hailo_insightface.py` | Main script - run this one |
-| `src/unified_hailo_face.py` | Hailo face detection |
-| `src/classification.py` | Gender/age classification (InsightFace) |
-| `src/kalman_tracker.py` | Person tracking + ReID |
+| `face_analysis_NEW/main.py` | Main script - run this one |
+| `src/detection/hailo_detector.py` | Hailo-8 face detection (RetinaFace/SCRFD) |
+| `src/classification/classifier.py` | Age/gender classification (ONNX MobileNet) |
+| `src/kalman_tracking/tracker.py` | Kalman filter tracking + Hungarian assignment |
+| `src/utils/face_crop.py` | Face cropping + quality gate |
+| `src/utils/types.py` | Shared data types |
+| `src/utils/json_logger.py` | JSONL output logger |
 
 ## Command Line Options
 
 ```bash
-python test_unified_hailo_insightface.py [options]
+python face_analysis_NEW/main.py [options]
 
---input         Video file or 'camera' (default: camera)
---display       Show video window
---face-conf     Face detection threshold (default: 0.4)
---sensor-id     Camera name for logs (default: SENSOR_001)
---log           Save detections to JSON file
+--input             Video file or 'camera' (default: camera)
+--display           Show video window
+--face-conf         Face detection threshold (default: 0.5)
+--sensor-id         Camera name for logs (default: SENSOR_001)
+--log               Save detections to JSONL file
+--output-video      Save annotated video to file
+--snapshot-dir      Save periodic snapshot images
+--snapshot-interval Seconds between snapshots (default: 60)
+--resolution        Camera resolution (default: 1280x960)
+--max-age           Frames before dropping lost track (default: 60)
+--min-hits          Confirmations before showing track (default: 3)
+--iou-threshold     Tracking IoU threshold (default: 0.15)
+--no-ids            Hide track IDs in display
 ```
 
 ## How it Works
 
-1. **Face Detection** - Hailo-8 runs RetinaFace model (~30 FPS)
-2. **Classification** - InsightFace extracts gender, age, and face embedding
-3. **Tracking** - Kalman filter tracks faces across frames
-4. **ReID** - When someone leaves and returns, they get the same ID back
-
-## ReID (Re-Identification)
-
-The system remembers people for 10 minutes after they leave the frame. When they come back, it matches their face embedding and gives them the same ID.
-
-Settings in `src/kalman_tracker.py`:
-```python
-REID_SIMILARITY_THRESHOLD = 0.4   # How similar faces need to be (0-1)
-GALLERY_MAX_AGE_SECONDS = 600     # Remember for 10 minutes
-```
+1. **Face Detection** - Hailo-8 runs RetinaFace/SCRFD model with hardware acceleration
+2. **Quality Gate** - Filters out blurry, dark, or tiny face crops
+3. **Classification** - ONNX MobileNet estimates age (101-bin softmax) and gender (sigmoid)
+4. **Tracking** - Kalman filter + Hungarian algorithm tracks people across frames
 
 ## Output Example
 
@@ -107,21 +117,32 @@ lsmod | grep hailo
 ## Project Structure
 
 ```
-Face detection Raspberry/
-├── src/
-│   ├── unified_hailo_face.py    # Hailo detector
-│   ├── classification.py        # Gender/age
-│   └── kalman_tracker.py        # Tracking + ReID
+face_analysis_NEW/
+├── main.py                        # Pipeline orchestrator
+├── requirements.txt
+├── scripts/
+│   └── download_models.sh         # Download ONNX model
 ├── models/
-│   └── hailo/                   # Hailo model files
-├── test_unified_hailo_insightface.py  # Main script
-└── requirements.txt
+│   └── hailo/                     # Hailo HEF model files
+└── src/
+    ├── detection/
+    │   └── hailo_detector.py      # Hailo face detection
+    ├── classification/
+    │   └── classifier.py          # ONNX age/gender
+    ├── kalman_tracking/
+    │   └── tracker.py             # Kalman + Hungarian tracking
+    └── utils/
+        ├── types.py               # Shared data types
+        ├── face_crop.py           # Face crop + quality gate
+        └── json_logger.py         # JSONL logger
 ```
 
 ## Dependencies
 
 - OpenCV
 - NumPy
-- InsightFace
+- ONNX Runtime
 - HailoRT (for Raspberry Pi)
+- SciPy (optional, for Hungarian assignment)
+
 
