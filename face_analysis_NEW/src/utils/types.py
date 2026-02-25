@@ -57,6 +57,7 @@ class TrackedPerson:
         return {
             "id": self.id,
             "age": round(self.age, 1),
+            "age_bucket": get_age_bucket(self.age),
             "gender": self.gender.lower(),
             "confidence": round(self.confidence, 2),
             "bbox": {

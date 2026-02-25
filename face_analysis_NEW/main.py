@@ -12,7 +12,7 @@ from typing import List, Dict, Tuple
 from src.detection.hailo_detector import UnifiedHailoFaceDetector, is_hailo_available
 from src.classification.classifier import AgeGenderClassifier
 from src.kalman_tracking.tracker import KalmanPersonTracker, format_output_json, calculate_iou
-from src.utils.types import TrackedPerson
+from src.utils.types import TrackedPerson, get_age_bucket
 from src.utils.face_crop import extract_face_crop, check_face_quality
 from src.utils.json_logger import JSONLogger
 
@@ -298,10 +298,10 @@ def draw_annotations(
             if gender != 'unknown':
                 label += f" {gender.capitalize()}"
             if age > 0:
-                label += f" {age:.0f}y"
+                label += f" {age:.0f}y {get_age_bucket(age)}"
             label += f" ({gender_conf:.2f})"
         else:
-            label = f"{gender.capitalize()} {age:.0f}y" if age > 0 else gender.capitalize()
+            label = f"{gender.capitalize()} {age:.0f}y {get_age_bucket(age)}" if age > 0 else gender.capitalize()
 
         (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(annotated, (x1, y1 - text_h - 10), (x1 + text_w + 5, y1), color, -1)

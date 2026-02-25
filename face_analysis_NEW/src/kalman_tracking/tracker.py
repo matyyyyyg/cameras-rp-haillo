@@ -1,7 +1,6 @@
 """
 Person Tracker using Kalman Filter and Hungarian Algorithm.
 """
-
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import deque
