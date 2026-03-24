@@ -9,12 +9,15 @@ import time
 from datetime import datetime
 from typing import List, Dict, Tuple
 
+from dotenv import load_dotenv
+
 from src.detection.hailo_detector import UnifiedHailoFaceDetector, is_hailo_available
 from src.classification.classifier import AgeGenderClassifier
 from src.kalman_tracking.tracker import KalmanPersonTracker, format_output_json, calculate_iou
 from src.utils.types import TrackedPerson, get_age_bucket
 from src.utils.face_crop import extract_face_crop, check_face_quality
 from src.utils.json_logger import JSONLogger
+from src.api.client import create_client_from_env
 
 # Configure logging
 logging.basicConfig(
@@ -374,6 +377,9 @@ Examples:
 
     args = parser.parse_args()
 
+    # Load .env file (from face_analysis_NEW/ directory)
+    load_dotenv(Path(__file__).parent / ".env")
+
     # Parse resolution
     try:
         res_w, res_h = (int(v) for v in args.resolution.split('x'))
@@ -402,6 +408,9 @@ Examples:
     except Exception as e:
         logger.error(f"Failed to initialize pipeline: {e}")
         return 1
+    
+    # Initialize API client (reads from .env)
+    api_client = create_client_from_env()
 
     # Initialize JSON logger
     json_logger = None
@@ -468,18 +477,33 @@ Examples:
             tracked_persons, client_output = pipeline.process_frame(frame)
             frame_time = time.time() - frame_start
 
-            # Log to JSON file at specified interval
+            # Log/send at specified interval
             current_time = time.time()
-            if json_logger and len(client_output['detections']) > 0:
-                if current_time - last_log_time >= args.log_interval:
-                    filtered_output = client_output.copy()
-                    filtered_output['detections'] = [
-                        d for d in client_output['detections']
-                        if d.get('confidence', 0) >= args.min_confidence
-                    ]
-                    if len(filtered_output['detections']) > 0:
+            should_report = current_time - last_log_time >= args.log_interval
+
+            if should_report and len(client_output['detections']) > 0:
+                # Filter by min confidence
+                confident_detections = [
+                    d for d in client_output['detections']
+                    if d.get('confidence', 0) >= args.min_confidence
+                ]
+                confident_persons = [
+                    p for p in tracked_persons
+                    if p.confidence >= args.min_confidence
+                ]
+
+                if confident_detections:
+                    # JSONL log
+                    if json_logger:
+                        filtered_output = client_output.copy()
+                        filtered_output['detections'] = confident_detections
                         json_logger.log(filtered_output)
-                        last_log_time = current_time
+
+                    # VisionCraft API
+                    if api_client and confident_persons:
+                        api_client.send_detections_async(confident_persons)
+
+                    last_log_time = current_time
 
             # FPS
             fps_display = 1.0 / frame_time if frame_time > 0 else 0

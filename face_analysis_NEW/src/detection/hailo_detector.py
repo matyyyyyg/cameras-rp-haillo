@@ -1,5 +1,6 @@
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
+import contextlib
 import logging
 import numpy as np
 import cv2
@@ -33,9 +34,6 @@ def is_hailo_available() -> bool:
 
 class UnifiedHailoFaceDetector:
 
-    # Minimum face size in pixels (width and height)
-    #MIN_FACE_SIZE = 30 - this is replaced by self.min_face_size which is set in the constructor and can be adjusted by the user
-   
     # Valid aspect ratio range for faces (width/height)
     MIN_ASPECT_RATIO = 0.4
     MAX_ASPECT_RATIO = 2.5
@@ -78,6 +76,7 @@ class UnifiedHailoFaceDetector:
         self._input_vstream_info = None
         self._output_vstream_infos = None
         self._initialized = False
+        self._model_type_logged = False
 
         # Model info
         self._input_height = None
@@ -134,15 +133,20 @@ class UnifiedHailoFaceDetector:
                 self._network_group, format_type=FormatType.FLOAT32
             )
 
-            self._network_group_context = self._network_group.activate()
-            self._network_group_context.__enter__()
+            self._exit_stack = contextlib.ExitStack()
+            try:
+                network_group_context = self._network_group.activate()
+                self._exit_stack.enter_context(network_group_context)
 
-            self._infer_pipeline = InferVStreams(
-                self._network_group,
-                self._input_vstream_params,
-                self._output_vstream_params
-            )
-            self._infer_pipeline.__enter__()
+                self._infer_pipeline = InferVStreams(
+                    self._network_group,
+                    self._input_vstream_params,
+                    self._output_vstream_params
+                )
+                self._exit_stack.enter_context(self._infer_pipeline)
+            except Exception:
+                self._exit_stack.close()
+                raise
 
             self._input_name = self._input_vstream_info.name
             shape = self._input_vstream_info.shape
@@ -170,12 +174,8 @@ class UnifiedHailoFaceDetector:
             raise RuntimeError(f"Failed to initialize Hailo face detector: {e}")
 
     def detect_faces(self, image: np.ndarray) -> List[Dict]:
-        
         if not self._initialized:
             raise RuntimeError("Hailo detector not initialized")
-
-        if cv2 is None:
-            raise ImportError("OpenCV not installed. Install: pip install opencv-python")
 
         input_data = self._preprocess(image)
         outputs = self._infer(input_data)
@@ -203,17 +203,19 @@ class UnifiedHailoFaceDetector:
         except Exception as e:
             logger.warning(f"Hailo inference failed, recreating pipeline: {e}")
             try:
-                self._infer_pipeline.__exit__(None, None, None)
-            except Exception:
-                pass
-            try:
                 from hailo_platform import InferVStreams
+                # Close old exit stack and create fresh one for new pipeline
+                if getattr(self, '_exit_stack', None):
+                    self._exit_stack.close()
+                self._exit_stack = contextlib.ExitStack()
+                network_group_context = self._network_group.activate()
+                self._exit_stack.enter_context(network_group_context)
                 self._infer_pipeline = InferVStreams(
                     self._network_group,
                     self._input_vstream_params,
                     self._output_vstream_params
                 )
-                self._infer_pipeline.__enter__()
+                self._exit_stack.enter_context(self._infer_pipeline)
                 return self._infer_pipeline.infer(input_dict)
             except Exception as e2:
                 logger.error(f"Hailo inference retry failed: {e2}")
@@ -228,204 +230,198 @@ class UnifiedHailoFaceDetector:
           - 4 channels = RetinaFace (2 anchors * 2 classes, softmax)
           - 2 channels = SCRFD (2 anchors * 1 class, sigmoid)
         """
-        try:
-            min_sizes_per_level = [[16, 32], [64, 128], [256, 512]]
-            steps = [8, 16, 32]
-            variance = [0.1, 0.2]
+        min_sizes_per_level = [[16, 32], [64, 128], [256, 512]]
+        steps = [8, 16, 32]
+        variance = [0.1, 0.2]
 
-            if not hasattr(self, '_postprocess_logged'):
-                self._postprocess_logged = True
-                for name, tensor in outputs.items():
-                    t = tensor.squeeze(0) if tensor.ndim == 4 else tensor
-                    logger.info(f"  Output tensor: {name} shape={t.shape} "
-                                f"min={t.min():.4f} max={t.max():.4f}")
-                    if t.shape[-1] in (2, 4):
-                        raw_max = t.max()
-                        sig_max = 1.0 / (1.0 + np.exp(-raw_max))
-                        logger.info(f"    ^ cls tensor: raw_max={raw_max:.4f}, sigmoid(raw_max)={sig_max:.4f}")
-
-            levels = {}
-            cls_channels = None
+        if not self._model_type_logged:
             for name, tensor in outputs.items():
-                if tensor.ndim == 4:
-                    tensor = tensor.squeeze(0)
-                h, w, c = tensor.shape
-                key = (h, w)
-                if key not in levels:
-                    levels[key] = {}
-                if c in (2, 4):
-                    levels[key]['cls'] = tensor
-                    cls_channels = c
-                elif c == 8:
-                    levels[key]['bbox'] = tensor
-                elif c == 20:
-                    levels[key]['lm'] = tensor
+                t = tensor.squeeze(0) if tensor.ndim == 4 else tensor
+                logger.info(f"  Output tensor: {name} shape={t.shape} "
+                            f"min={t.min():.4f} max={t.max():.4f}")
+                if t.shape[-1] in (2, 4):
+                    raw_max = t.max()
+                    sig_max = 1.0 / (1.0 + np.exp(-raw_max))
+                    logger.info(f"    ^ cls tensor: raw_max={raw_max:.4f}, sigmoid(raw_max)={sig_max:.4f}")
 
-            is_scrfd = (cls_channels == 2)
+        levels = {}
+        cls_channels = None
+        for name, tensor in outputs.items():
+            if tensor.ndim == 4:
+                tensor = tensor.squeeze(0)
+            h, w, c = tensor.shape
+            key = (h, w)
+            if key not in levels:
+                levels[key] = {}
+            if c in (2, 4):
+                levels[key]['cls'] = tensor
+                cls_channels = c
+            elif c == 8:
+                levels[key]['bbox'] = tensor
+            elif c == 20:
+                levels[key]['lm'] = tensor
+
+        is_scrfd = (cls_channels == 2)
+        if not self._model_type_logged:
+            self._model_type_logged = True
             if is_scrfd:
                 logger.info("Auto-detected SCRFD model (cls channels=2, sigmoid)")
             else:
                 logger.info("Auto-detected RetinaFace model (cls channels=4, softmax)")
 
-            sorted_levels = sorted(levels.items(), key=lambda x: x[0][0] * x[0][1], reverse=True)
+        sorted_levels = sorted(levels.items(), key=lambda x: x[0][0] * x[0][1], reverse=True)
 
-            all_boxes = []
-            all_scores = []
-            all_landmarks = []
+        all_boxes = []
+        all_scores = []
+        all_landmarks = []
 
-            for level_idx, ((feat_h, feat_w), tensors) in enumerate(sorted_levels):
-                if 'cls' not in tensors or 'bbox' not in tensors:
+        for level_idx, ((feat_h, feat_w), tensors) in enumerate(sorted_levels):
+            if 'cls' not in tensors or 'bbox' not in tensors:
+                continue
+
+            step = steps[level_idx]
+            min_sizes = min_sizes_per_level[level_idx]
+
+            cls_data = tensors['cls']
+            bbox_data = tensors['bbox']
+            lm_data = tensors.get('lm')
+
+            cols = np.arange(feat_w, dtype=np.float32)
+            rows = np.arange(feat_h, dtype=np.float32)
+            col_grid, row_grid = np.meshgrid(cols, rows)
+            cx = (col_grid + 0.5) * step
+            cy = (row_grid + 0.5) * step
+
+            for anchor_idx, anchor_size in enumerate(min_sizes):
+                if is_scrfd:
+                    raw_scores = cls_data[:, :, anchor_idx]
+                    if raw_scores.max() > 1.0 or raw_scores.min() < 0.0:
+                        scores = 1.0 / (1.0 + np.exp(-raw_scores))
+                    else:
+                        scores = raw_scores
+                else:
+                    bg = cls_data[:, :, anchor_idx * 2]
+                    fg = cls_data[:, :, anchor_idx * 2 + 1]
+                    max_val = np.maximum(bg, fg)
+                    exp_bg = np.exp(bg - max_val)
+                    exp_fg = np.exp(fg - max_val)
+                    scores = exp_fg / (exp_bg + exp_fg)
+
+                mask = scores >= self.confidence_threshold
+                if not np.any(mask):
                     continue
 
-                step = steps[level_idx]
-                min_sizes = min_sizes_per_level[level_idx]
+                scores_f = scores[mask]
+                cx_f = cx[mask]
+                cy_f = cy[mask]
 
-                cls_data = tensors['cls']
-                bbox_data = tensors['bbox']
-                lm_data = tensors.get('lm')
+                off = anchor_idx * 4
+                d0 = bbox_data[:, :, off][mask]
+                d1 = bbox_data[:, :, off + 1][mask]
+                d2 = bbox_data[:, :, off + 2][mask]
+                d3 = bbox_data[:, :, off + 3][mask]
 
-                cols = np.arange(feat_w, dtype=np.float32)
-                rows = np.arange(feat_h, dtype=np.float32)
-                col_grid, row_grid = np.meshgrid(cols, rows)
-                cx = (col_grid + 0.5) * step
-                cy = (row_grid + 0.5) * step
+                if is_scrfd:
+                    x1 = cx_f - d0 * step
+                    y1 = cy_f - d1 * step
+                    x2 = cx_f + d2 * step
+                    y2 = cy_f + d3 * step
+                else:
+                    pred_cx = cx_f + d0 * variance[0] * anchor_size
+                    pred_cy = cy_f + d1 * variance[0] * anchor_size
+                    pred_w = anchor_size * np.exp(d2 * variance[1])
+                    pred_h = anchor_size * np.exp(d3 * variance[1])
+                    x1 = pred_cx - pred_w / 2
+                    y1 = pred_cy - pred_h / 2
+                    x2 = pred_cx + pred_w / 2
+                    y2 = pred_cy + pred_h / 2
 
-                for anchor_idx, anchor_size in enumerate(min_sizes):
-                    if is_scrfd:
-                        raw_scores = cls_data[:, :, anchor_idx]
-                        if raw_scores.max() > 1.0 or raw_scores.min() < 0.0:
-                            scores = 1.0 / (1.0 + np.exp(-raw_scores))
+                boxes = np.stack([x1, y1, x2, y2], axis=1)
+                all_boxes.append(boxes)
+                all_scores.append(scores_f)
+
+                if lm_data is not None:
+                    lm_off = anchor_idx * 10
+                    landmarks = np.zeros((len(scores_f), 10), dtype=np.float32)
+                    for pt in range(5):
+                        lx = lm_data[:, :, lm_off + pt * 2][mask]
+                        ly = lm_data[:, :, lm_off + pt * 2 + 1][mask]
+                        if is_scrfd:
+                            landmarks[:, pt * 2] = cx_f + lx * step
+                            landmarks[:, pt * 2 + 1] = cy_f + ly * step
                         else:
-                            scores = raw_scores
-                    else:
-                        bg = cls_data[:, :, anchor_idx * 2]
-                        fg = cls_data[:, :, anchor_idx * 2 + 1]
-                        max_val = np.maximum(bg, fg)
-                        exp_bg = np.exp(bg - max_val)
-                        exp_fg = np.exp(fg - max_val)
-                        scores = exp_fg / (exp_bg + exp_fg)
+                            landmarks[:, pt * 2] = cx_f + lx * variance[0] * anchor_size
+                            landmarks[:, pt * 2 + 1] = cy_f + ly * variance[0] * anchor_size
+                    all_landmarks.append(landmarks)
 
-                    mask = scores >= self.confidence_threshold
-                    if not np.any(mask):
-                        continue
-
-                    scores_f = scores[mask]
-                    cx_f = cx[mask]
-                    cy_f = cy[mask]
-
-                    off = anchor_idx * 4
-                    d0 = bbox_data[:, :, off][mask]
-                    d1 = bbox_data[:, :, off + 1][mask]
-                    d2 = bbox_data[:, :, off + 2][mask]
-                    d3 = bbox_data[:, :, off + 3][mask]
-
-                    if is_scrfd:
-                        x1 = cx_f - d0 * step
-                        y1 = cy_f - d1 * step
-                        x2 = cx_f + d2 * step
-                        y2 = cy_f + d3 * step
-                    else:
-                        pred_cx = cx_f + d0 * variance[0] * anchor_size
-                        pred_cy = cy_f + d1 * variance[0] * anchor_size
-                        pred_w = anchor_size * np.exp(d2 * variance[1])
-                        pred_h = anchor_size * np.exp(d3 * variance[1])
-                        x1 = pred_cx - pred_w / 2
-                        y1 = pred_cy - pred_h / 2
-                        x2 = pred_cx + pred_w / 2
-                        y2 = pred_cy + pred_h / 2
-
-                    boxes = np.stack([x1, y1, x2, y2], axis=1)
-                    all_boxes.append(boxes)
-                    all_scores.append(scores_f)
-
-                    if lm_data is not None:
-                        lm_off = anchor_idx * 10
-                        landmarks = np.zeros((len(scores_f), 10), dtype=np.float32)
-                        for pt in range(5):
-                            lx = lm_data[:, :, lm_off + pt * 2][mask]
-                            ly = lm_data[:, :, lm_off + pt * 2 + 1][mask]
-                            if is_scrfd:
-                                landmarks[:, pt * 2] = cx_f + lx * step
-                                landmarks[:, pt * 2 + 1] = cy_f + ly * step
-                            else:
-                                landmarks[:, pt * 2] = cx_f + lx * variance[0] * anchor_size
-                                landmarks[:, pt * 2 + 1] = cy_f + ly * variance[0] * anchor_size
-                        all_landmarks.append(landmarks)
-
-            if not all_boxes:
-                return []
-
-            all_boxes = np.concatenate(all_boxes, axis=0)
-            all_scores = np.concatenate(all_scores, axis=0)
-            if all_landmarks:
-                all_landmarks = np.concatenate(all_landmarks, axis=0)
-            else:
-                all_landmarks = None
-
-            logger.debug(f"Pre-NMS candidates: {len(all_scores)}")
-
-            orig_h, orig_w = original_shape[:2]
-            scale_x = orig_w / self._input_width
-            scale_y = orig_h / self._input_height
-
-            all_boxes[:, 0] *= scale_x
-            all_boxes[:, 1] *= scale_y
-            all_boxes[:, 2] *= scale_x
-            all_boxes[:, 3] *= scale_y
-
-            if all_landmarks is not None:
-                all_landmarks[:, 0::2] *= scale_x
-                all_landmarks[:, 1::2] *= scale_y
-
-            valid = (all_boxes[:, 2] > all_boxes[:, 0]) & (all_boxes[:, 3] > all_boxes[:, 1])
-            if not np.any(valid):
-                return []
-            all_boxes = all_boxes[valid]
-            all_scores = all_scores[valid]
-            if all_landmarks is not None:
-                all_landmarks = all_landmarks[valid]
-
-            keep = self._nms(all_boxes, all_scores, self.nms_threshold)
-
-            detections = []
-            filtered_count = 0
-            for i in keep:
-                x1, y1, x2, y2 = all_boxes[i]
-                x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-                if w <= 0 or h <= 0:
-                    continue
-
-                if w < self.min_face_size or h < self.min_face_size:
-                    filtered_count += 1
-                    continue
-
-                aspect_ratio = w / max(h, 1)
-                if aspect_ratio < self.MIN_ASPECT_RATIO or aspect_ratio > self.MAX_ASPECT_RATIO:
-                    filtered_count += 1
-                    continue
-
-                det = {
-                    'box': (x, y, w, h),
-                    'confidence': float(all_scores[i])
-                }
-                if all_landmarks is not None:
-                    lm = all_landmarks[i]
-                    det['landmarks'] = [(int(lm[j]), int(lm[j+1])) for j in range(0, 10, 2)]
-                detections.append(det)
-
-            if filtered_count > 0:
-                logger.debug(f"Filtered {filtered_count} detections (size/aspect ratio)")
-
-            if len(detections) == 0 and len(all_scores) > 0:
-                logger.debug(f"No detections passed filters (pre-NMS: {len(all_scores)}, post-NMS: {len(keep)}, filtered: {filtered_count})")
-
-            return detections
-
-        except Exception as e:
-            logger.error(f"Postprocessing failed: {e}")
-            logger.debug(f"Output keys: {list(outputs.keys())}")
-            logger.debug(f"Output shapes: {[(k, v.shape) for k, v in outputs.items()]}")
+        if not all_boxes:
             return []
+
+        all_boxes = np.concatenate(all_boxes, axis=0)
+        all_scores = np.concatenate(all_scores, axis=0)
+        if all_landmarks:
+            all_landmarks = np.concatenate(all_landmarks, axis=0)
+        else:
+            all_landmarks = None
+
+        logger.debug(f"Pre-NMS candidates: {len(all_scores)}")
+
+        orig_h, orig_w = original_shape[:2]
+        scale_x = orig_w / self._input_width
+        scale_y = orig_h / self._input_height
+
+        all_boxes[:, 0] *= scale_x
+        all_boxes[:, 1] *= scale_y
+        all_boxes[:, 2] *= scale_x
+        all_boxes[:, 3] *= scale_y
+
+        if all_landmarks is not None:
+            all_landmarks[:, 0::2] *= scale_x
+            all_landmarks[:, 1::2] *= scale_y
+
+        valid = (all_boxes[:, 2] > all_boxes[:, 0]) & (all_boxes[:, 3] > all_boxes[:, 1])
+        if not np.any(valid):
+            return []
+        all_boxes = all_boxes[valid]
+        all_scores = all_scores[valid]
+        if all_landmarks is not None:
+            all_landmarks = all_landmarks[valid]
+
+        keep = self._nms(all_boxes, all_scores, self.nms_threshold)
+
+        detections = []
+        filtered_count = 0
+        for i in keep:
+            x1, y1, x2, y2 = all_boxes[i]
+            x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+            if w <= 0 or h <= 0:
+                continue
+
+            if w < self.min_face_size or h < self.min_face_size:
+                filtered_count += 1
+                continue
+
+            aspect_ratio = w / max(h, 1)
+            if aspect_ratio < self.MIN_ASPECT_RATIO or aspect_ratio > self.MAX_ASPECT_RATIO:
+                filtered_count += 1
+                continue
+
+            det = {
+                'box': (x, y, w, h),
+                'confidence': float(all_scores[i])
+            }
+            if all_landmarks is not None:
+                lm = all_landmarks[i]
+                det['landmarks'] = [(int(lm[j]), int(lm[j+1])) for j in range(0, 10, 2)]
+            detections.append(det)
+
+        if filtered_count > 0:
+            logger.debug(f"Filtered {filtered_count} detections (size/aspect ratio)")
+
+        if len(detections) == 0 and len(all_scores) > 0:
+            logger.debug(f"No detections passed filters (pre-NMS: {len(all_scores)}, post-NMS: {len(keep)}, filtered: {filtered_count})")
+
+        return detections
 
     @staticmethod
     def _nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> List[int]:
@@ -457,39 +453,16 @@ class UnifiedHailoFaceDetector:
         return keep
 
     def cleanup(self) -> None:
-        """Release Hailo resources."""
-        try:
-            if getattr(self, '_infer_pipeline', None):
-                try:
-                    self._infer_pipeline.__exit__(None, None, None)
-                except Exception:
-                    pass
-            if getattr(self, '_network_group_context', None):
-                try:
-                    self._network_group_context.__exit__(None, None, None)
-                except Exception:
-                    pass
-            if getattr(self, '_network_group', None):
-                try:
-                    del self._network_group
-                except Exception:
-                    pass
-            if getattr(self, '_hef', None):
-                try:
-                    del self._hef
-                except Exception:
-                    pass
-            if getattr(self, '_vdevice', None):
-                try:
-                    del self._vdevice
-                except Exception:
-                    pass
+        """Release Hailo resources safely via ExitStack."""
+        if getattr(self, '_exit_stack', None):
+            self._exit_stack.close()
+            self._exit_stack = None
 
-            self._initialized = False
-            logger.info("Hailo face detector cleaned up")
-
-        except Exception as e:
-            logger.error(f"Cleanup failed: {e}")
+        self._network_group = None
+        self._hef = None
+        self._vdevice = None
+        self._initialized = False
+        logger.info("Hailo face detector cleaned up")
 
     def __del__(self):
         self.cleanup()

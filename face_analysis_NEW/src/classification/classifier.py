@@ -92,15 +92,15 @@ class AgeGenderClassifier:
         if face_crop is None or face_crop.size == 0:
             return None
 
+        input_tensor = self._preprocess(face_crop)
+
         try:
-            input_tensor = self._preprocess(face_crop)
             outputs = self.session.run(self._output_names, {self._input_name: input_tensor})
-
-            return self._parse_outputs(outputs)
-
-        except Exception as e:
-            logger.error(f"Classification failed: {e}")
+        except RuntimeError as e:
+            logger.warning(f"ORT inference error (transient): {e}")
             return None
+
+        return self._parse_outputs(outputs)
 
     def _parse_outputs(self, outputs) -> ClassificationResult:
         """Parse HSE MobileNet outputs (age softmax + gender sigmoid)."""
@@ -126,15 +126,13 @@ class AgeGenderClassifier:
         # Debug: log raw outputs on first run
         if self._first_run:
             self._first_run = False
-            logger.info(f"DEBUG age_probs shape={age_probs.shape}, top5={age_probs[np.argsort(age_probs)[-5:]]}")
-            logger.info(f"DEBUG top5 indices={np.argsort(age_probs)[-5:]}")
-            logger.info(f"DEBUG gender_val={gender_val:.4f}")
+            logger.debug(f"age_probs shape={age_probs.shape}, top5={age_probs[np.argsort(age_probs)[-5:]]}")
+            logger.debug(f"top5 indices={np.argsort(age_probs)[-5:]}")
+            logger.debug(f"gender_val={gender_val:.4f}")
 
-        # --- Age: weighted average of top-2 softmax classes ---
-        top2_idx = np.argsort(age_probs)[-2:]
-        top2_probs = age_probs[top2_idx]
-        top2_probs = top2_probs / top2_probs.sum()
-        age = float(np.sum((top2_idx + MIN_AGE) * top2_probs))
+        # --- Age: expected value over full softmax distribution ---
+        ages = np.arange(MIN_AGE, MIN_AGE + len(age_probs), dtype=np.float32)
+        age = float(np.sum(ages * age_probs))
         age = max(0.0, min(age, 100.0))
 
         # --- Gender: sigmoid >= 0.6 → male (from source is_male()) ---

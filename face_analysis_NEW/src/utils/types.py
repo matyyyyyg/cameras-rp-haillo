@@ -51,8 +51,8 @@ class TrackedPerson:
         x1, y1, x2, y2 = self.bbox
         width = x2 - x1
         height = y2 - y1
-        xc = x1 + width // 2
-        yc = y1 + height // 2
+        xc = x1 + width // 2  # Center x
+        yc = y1 + height // 2  # Center y
 
         return {
             "id": self.id,
