@@ -9,11 +9,28 @@ import time
 from datetime import datetime
 from typing import List, Dict, Tuple
 
+from dotenv import load_dotenv
+
+from src.detection.hailo_detector import UnifiedHailoFaceDetector, is_hailo_available
+from src.classification.classifier import AgeGenderClassifier
+from src.kalman_tracking.tracker import KalmanPersonTracker, format_output_json, calculate_iou
+from src.utils.types import TrackedPerson, get_age_bucket
+from src.utils.face_crop import extract_face_crop, check_face_quality
+from src.utils.json_logger import JSONLogger
+from src.api.client import create_client_from_env
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 
 class PiCameraCapture:
     """Wrapper around Picamera2 that mimics cv2.VideoCapture interface."""
 
-    def __init__(self, width=640, height=480, framerate=30):
+    def __init__(self, width=1280, height=960, framerate=30):
         from picamera2 import Picamera2
         self._picam = Picamera2()
         config = self._picam.create_preview_configuration(
@@ -23,6 +40,9 @@ class PiCameraCapture:
         self._picam.configure(config)
         self._picam.start()
         self._opened = True
+        self._width = width
+        self._height = height
+        self._framerate = framerate
 
     def isOpened(self):
         return self._opened
@@ -35,11 +55,11 @@ class PiCameraCapture:
 
     def get(self, prop):
         if prop == cv2.CAP_PROP_FPS:
-            return 30
+            return self._framerate
         if prop == cv2.CAP_PROP_FRAME_WIDTH:
-            return 640
+            return self._width
         if prop == cv2.CAP_PROP_FRAME_HEIGHT:
-            return 480
+            return self._height
         return 0
 
     def release(self):
@@ -47,64 +67,45 @@ class PiCameraCapture:
             self._picam.stop()
             self._opened = False
 
-# Import Hailo face detector (auto-detects RetinaFace vs SCRFD)
-from src.unified_hailo_face import UnifiedHailoFaceDetector, is_hailo_available
 
-# Import Kalman tracker
-from src.kalman_tracker import KalmanPersonTracker, format_output_json, TrackedPerson, calculate_iou
-
-# Import ensemble classifier (InsightFace + Caffe)
-from src.classification import AgeGenderClassifier, extract_face_crop
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-class UnifiedHailoInsightFacePipeline:
+class FaceAnalysisPipeline:
     """
-    Complete pipeline: Hailo face detection + InsightFace gender + Kalman tracking.
+    Complete pipeline: Hailo face detection + ONNX age/gender + Kalman tracking.
     """
 
     # Classification skip settings
-    RECLASS_INTERVAL = 30           # Force reclassification every N frames
-    GENDER_CONF_THRESHOLD = 0.8     # Min gender confidence to skip reclassification
-    SKIP_IOU_THRESHOLD = 0.25       # IoU threshold for pre-matching detections to tracks
+    RECLASS_INTERVAL = 90
+    GENDER_CONF_THRESHOLD = 0.8
+    SKIP_IOU_THRESHOLD = 0.25
+    MIN_GENDER_VOTES = 2
 
     def __init__(
         self,
         sensor_id: str = "SENSOR_001",
         hailo_model_path: str = None,
         face_confidence: float = 0.5,
-        insightface_model: str = 'buffalo_l',
-        max_age: int = 30,
+        age_gender_model: str = None,
+        max_age: int = 60,
         min_hits: int = 3,
-        iou_threshold: float = 0.25
+        iou_threshold: float = 0.15
     ):
-        """Initialize pipeline with tracking."""
-        logger.info("Initializing Unified Hailo + InsightFace Ensemble + Tracking Pipeline...")
+        logger.info("Initializing Face Analysis Pipeline...")
 
         self.sensor_id = sensor_id
         self._frame_number = 0
 
-        # Initialize Hailo face detector (RetinaFace)
+        # 1/3: Hailo face detector
         logger.info("1/3: Initializing Hailo RetinaFace detector...")
         self.face_detector = UnifiedHailoFaceDetector(
             model_path=hailo_model_path,
             confidence_threshold=face_confidence
         )
 
-        # Initialize ensemble classifier (InsightFace + Caffe)
-        logger.info(f"2/3: Initializing ensemble classifier (InsightFace {insightface_model} + Caffe)...")
-        self.classifier = AgeGenderClassifier(
-            prefer_insightface=True,
-            insightface_model=insightface_model
-        )
+        # 2/3: ONNX age/gender classifier
+        logger.info("2/3: Initializing ONNX age/gender classifier...")
+        self.classifier = AgeGenderClassifier(model_path=age_gender_model)
 
-        # Initialize Kalman tracker
+        # 3/3: Kalman tracker
         logger.info("3/3: Initializing Kalman person tracker...")
         self.tracker = KalmanPersonTracker(
             sensor_id=sensor_id,
@@ -120,15 +121,7 @@ class UnifiedHailoInsightFacePipeline:
         logger.info("Pipeline initialized successfully")
 
     def _match_detection_to_track(self, det_bbox: Tuple[int, int, int, int]) -> int:
-        """
-        Pre-match a detection bbox to existing tracker tracks using IoU.
-
-        Args:
-            det_bbox: Detection bounding box (x1, y1, x2, y2)
-
-        Returns:
-            Track ID of best match, or -1 if no match above threshold
-        """
+        """Pre-match a detection to existing tracks using IoU."""
         best_iou = 0.0
         best_id = -1
         for tracker in self.tracker.trackers:
@@ -141,10 +134,6 @@ class UnifiedHailoInsightFacePipeline:
             return best_id
         return -1
 
-    # Minimum gender votes before skipping is allowed
-    MIN_GENDER_VOTES = 3
-    EMBEDDING_REFRESH_INTERVAL = 60  # Force embedding refresh every N frames for ReID
-
     def _can_skip_classification(self, track_id: int) -> bool:
         """Check if a track has confident enough attributes to skip classification."""
         if track_id < 0:
@@ -152,16 +141,8 @@ class UnifiedHailoInsightFacePipeline:
         attrs = self.tracker.track_attributes.get(track_id)
         if attrs is None:
             return False
-        # Force reclassification periodically
         if self._frame_number % self.RECLASS_INTERVAL == 0:
             return False
-        # Force classification if no embedding (needed for ReID)
-        if attrs.get('embedding') is None:
-            return False
-        # Periodically refresh embedding for ReID accuracy
-        if self._frame_number % self.EMBEDDING_REFRESH_INTERVAL == 0:
-            return False
-        # Require minimum number of votes so early 1/1 = 100% doesn't skip prematurely
         total_votes = attrs.get('gender_votes_male', 0) + attrs.get('gender_votes_female', 0)
         if total_votes < self.MIN_GENDER_VOTES:
             return False
@@ -172,43 +153,31 @@ class UnifiedHailoInsightFacePipeline:
 
     def process_frame(self, frame: np.ndarray) -> Tuple[List[TrackedPerson], Dict]:
         """
-        Process a single frame: detect faces + classify gender + track persons.
-
-        Skips InsightFace classification for detections that match existing tracks
-        with confident attributes, reclassifying every RECLASS_INTERVAL frames.
-        Uses batch classification for efficiency when multiple faces need classification.
-
-        Args:
-            frame: Input frame (BGR)
+        Process a single frame: detect -> quality gate -> classify -> track.
 
         Returns:
             Tuple of (tracked_persons, client_json_output)
         """
         self._frame_number += 1
 
-        # --- Stage 1: Detect faces using Hailo ---
+        # --- Stage 1: Detect faces ---
         t0 = time.time()
         faces = self.face_detector.detect_faces(frame)
         t1 = time.time()
 
-        # --- Stage 2: Classify gender + age (with skip logic + batch processing) ---
+        # --- Stage 2: Classify (with skip + quality gate) ---
         detections = []
         skipped = 0
+        quality_rejected = 0
         total = len(faces)
 
-        # Collect faces needing classification for batch processing
-        faces_to_classify = []  # List of (index, face_crop, face_data)
-        skipped_detections = []  # List of (index, detection)
-
-        for idx, face in enumerate(faces):
+        for face in faces:
             x, y, w, h = face['box']
             bbox = (x, y, x + w, y + h)
 
-            # Try to pre-match this detection to an existing track
             matched_track_id = self._match_detection_to_track(bbox)
 
             if self._can_skip_classification(matched_track_id):
-                # Reuse cached attributes from the matched track
                 attrs = self.tracker.track_attributes[matched_track_id]
                 detection = {
                     'box': (x, y, w, h),
@@ -217,48 +186,58 @@ class UnifiedHailoInsightFacePipeline:
                     'gender': attrs['gender'],
                     'gender_confidence': attrs['gender_confidence'],
                     'age': attrs['age'],
-                    'embedding': attrs.get('embedding')  # CRITICAL: Pass embedding for ReID
                 }
-                skipped_detections.append((idx, detection))
                 skipped += 1
             else:
-                # Collect for batch classification
-                # Phase 4.1: Pass landmarks to extract_face_crop for alignment
-                landmarks = face.get('landmarks')  # Hailo may provide 5-point landmarks
-                face_crop = extract_face_crop(frame, bbox, landmarks=landmarks)
+                face_crop = extract_face_crop(frame, bbox)
                 if face_crop.size == 0:
                     continue
-                faces_to_classify.append((idx, face_crop, {'box': (x, y, w, h), 'bbox': bbox, 'confidence': face['confidence']}))
 
-        # Batch classify all faces that need classification
-        if faces_to_classify:
-            face_crops = [item[1] for item in faces_to_classify]
-            results = self.classifier.classify_batch(face_crops)
+                # Quality gate
+                passed, metrics = check_face_quality(face_crop)
+                if not passed:
+                    quality_rejected += 1
+                    # Still add to tracker with unknown attributes so tracking continues
+                    detection = {
+                        'box': (x, y, w, h),
+                        'bbox': bbox,
+                        'confidence': face['confidence'],
+                        'gender': 'unknown',
+                        'gender_confidence': 0.0,
+                        'age': 0.0,
+                    }
+                    detections.append(detection)
+                    continue
 
-            for (idx, _, face_data), result in zip(faces_to_classify, results):
-                detection = {
-                    'box': face_data['box'],
-                    'bbox': face_data['bbox'],
-                    'confidence': face_data['confidence'],
-                    'gender': result.gender.lower(),
-                    'gender_confidence': result.gender_confidence,
-                    'age': result.raw_age if result.raw_age is not None else result.age_midpoint,
-                    'embedding': result.embedding  # For ReID
-                }
-                detections.append((idx, detection))
+                result = self.classifier.classify(face_crop)
+                if result is None:
+                    detection = {
+                        'box': (x, y, w, h),
+                        'bbox': bbox,
+                        'confidence': face['confidence'],
+                        'gender': 'unknown',
+                        'gender_confidence': 0.0,
+                        'age': 0.0,
+                    }
+                else:
+                    detection = {
+                        'box': (x, y, w, h),
+                        'bbox': bbox,
+                        'confidence': face['confidence'],
+                        'gender': result.gender.lower(),
+                        'gender_confidence': result.gender_confidence,
+                        'age': result.age,
+                    }
 
-        # Combine and sort by original index to maintain order
-        all_detections = skipped_detections + detections
-        all_detections.sort(key=lambda x: x[0])
-        detections = [d[1] for d in all_detections]
+            detections.append(detection)
 
         t2 = time.time()
 
-        # --- Stage 3: Update tracker with detections ---
+        # --- Stage 3: Update tracker ---
         tracked_persons = self.tracker.update(detections)
         t3 = time.time()
 
-        # Accumulate timing (convert to ms)
+        # Accumulate timing (ms)
         self.timing['detect'] += (t1 - t0) * 1000
         self.timing['classify'] += (t2 - t1) * 1000
         self.timing['track'] += (t3 - t2) * 1000
@@ -271,27 +250,25 @@ class UnifiedHailoInsightFacePipeline:
             avg_t = self.timing['track'] / self.timing_count
             logger.info(
                 f"detect={avg_d:.1f}ms  classify={avg_c:.1f}ms  "
-                f"track={avg_t:.1f}ms  skipped={skipped}/{total}"
+                f"track={avg_t:.1f}ms  skipped={skipped}/{total}  "
+                f"quality_rejected={quality_rejected}/{total}"
             )
-            # Reset accumulators
             self.timing = {'detect': 0.0, 'classify': 0.0, 'track': 0.0}
             self.timing_count = 0
 
-        # Format output as client JSON
+        # Format output
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
         client_output = format_output_json(tracked_persons, self.sensor_id, timestamp)
 
         return tracked_persons, client_output
 
     def get_tracker_stats(self) -> Dict:
-        """Get tracker statistics."""
         return {
             "active_tracks": self.tracker.get_active_count(),
             "total_unique_persons": self.tracker.get_total_count()
         }
 
     def cleanup(self):
-        """Release resources."""
         self.face_detector.cleanup()
 
 
@@ -310,77 +287,45 @@ def draw_annotations(
         age = person.age
         person_id = person.id
 
-        # Color based on gender
         if gender.lower() == 'male':
-            color = (255, 150, 0)  # Blue-ish for male
+            color = (255, 150, 0)
         elif gender.lower() == 'female':
-            color = (147, 20, 255)  # Pink for female
+            color = (147, 20, 255)
         else:
-            color = (128, 128, 128)  # Gray for unknown
+            color = (128, 128, 128)
 
-        # Draw bounding box
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
-        # Build label
         if show_ids:
             label = f"ID:{person_id}"
             if gender != 'unknown':
                 label += f" {gender.capitalize()}"
             if age > 0:
-                label += f" {age:.0f}y"
+                label += f" {age:.0f}y {get_age_bucket(age)}"
             label += f" ({gender_conf:.2f})"
         else:
-            label = f"{gender.capitalize()} {age:.0f}y" if age > 0 else gender.capitalize()
+            label = f"{gender.capitalize()} {age:.0f}y {get_age_bucket(age)}" if age > 0 else gender.capitalize()
 
-        # Draw label background
         (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(annotated, (x1, y1 - text_h - 10), (x1 + text_w + 5, y1), color, -1)
-
-        # Draw label text
         cv2.putText(annotated, label, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     return annotated
 
 
-class JSONLogger:
-    """Logger for client JSON format output."""
-
-    def __init__(self, output_path: Path):
-        """Initialize JSON logger."""
-        self.output_path = output_path
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Clear/create file
-        with open(self.output_path, 'w') as f:
-            pass  # Create empty file
-
-        self.frame_count = 0
-        logger.info(f"JSON logger initialized: {output_path}")
-
-    def log(self, client_output: Dict) -> None:
-        """Append a JSON object to the log file (JSON Lines format)."""
-        with open(self.output_path, 'a') as f:
-            json.dump(client_output, f)
-            f.write('\n')
-        self.frame_count += 1
-
-    def get_stats(self) -> Dict:
-        """Get logging statistics."""
-        return {"frames_logged": self.frame_count, "output_path": str(self.output_path)}
-
-
 def main():
     parser = argparse.ArgumentParser(
+        description="Face Analysis: Hailo Detection + ONNX Age/Gender + Kalman Tracking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python test_unified_hailo_insightface.py --display
-  python test_unified_hailo_insightface.py --input video.mp4 --log detections.jsonl
-  python test_unified_hailo_insightface.py --sensor-id CAM_ENTRANCE --log logs/entrance.jsonl
+  python main.py --display
+  python main.py --input video.mp4 --log detections.jsonl
+  python main.py --sensor-id CAM_ENTRANCE --log logs/entrance.jsonl
         """
     )
 
-    # Input/output options
+    # Input/output
     parser.add_argument('--input', type=str, default='camera',
                         help='Input: camera, video file path, or image')
     parser.add_argument('--log', type=str, default=None,
@@ -388,24 +333,24 @@ Examples:
     parser.add_argument('--output-video', type=str, default=None,
                         help='Save annotated output video')
 
-    # Sensor configuration
+    # Sensor
     parser.add_argument('--sensor-id', type=str, default='SENSOR_001',
                         help='Unique sensor/camera identifier')
 
-    # Detection parameters
+    # Detection
     parser.add_argument('--hailo-model', type=str, default=None,
                         help='Path to Hailo face detection HEF')
-    parser.add_argument('--face-conf', type=float, default=0.4,
-                        help='Face detection confidence threshold (lowered for better recall)')
-    parser.add_argument('--insightface-model', type=str, default='buffalo_l',
-                        help='InsightFace model pack: buffalo_l (accurate) or buffalo_s (fast)')
+    parser.add_argument('--face-conf', type=float, default=0.5,
+                        help='Face detection confidence threshold')
+    parser.add_argument('--age-gender-model', type=str, default=None,
+                        help='Path to ONNX age/gender model')
 
-    # Tracking parameters
-    parser.add_argument('--max-age', type=int, default=30,
+    # Tracking
+    parser.add_argument('--max-age', type=int, default=60,
                         help='Max frames to keep track without detection')
-    parser.add_argument('--min-hits', type=int, default=4,
-                        help='Min detections to confirm track (increased to reduce false positives)')
-    parser.add_argument('--iou-threshold', type=float, default=0.25,
+    parser.add_argument('--min-hits', type=int, default=3,
+                        help='Min detections to confirm track')
+    parser.add_argument('--iou-threshold', type=float, default=0.15,
                         help='Min IoU for track association')
 
     # Logging frequency
@@ -414,19 +359,33 @@ Examples:
     parser.add_argument('--min-confidence', type=float, default=0.5,
                         help='Minimum confidence to log detection (default: 0.5)')
 
-    # Display options
+    # Camera resolution
+    parser.add_argument('--resolution', type=str, default='1280x960',
+                        help='Camera resolution as WxH (default: 1280x960)')
+
+    # Display
     parser.add_argument('--display', action='store_true',
                         help='Display output video window')
     parser.add_argument('--no-ids', action='store_true',
                         help='Hide tracking IDs in display')
 
-    # Remote monitoring
+    # Snapshots
     parser.add_argument('--snapshot-dir', type=str, default=None,
-                        help='Directory to save periodic snapshots for remote monitoring')
+                        help='Directory to save periodic snapshots')
     parser.add_argument('--snapshot-interval', type=float, default=60.0,
                         help='Save snapshot every N seconds (default: 60)')
 
     args = parser.parse_args()
+
+    # Load .env file (from face_analysis_NEW/ directory)
+    load_dotenv(Path(__file__).parent / ".env")
+
+    # Parse resolution
+    try:
+        res_w, res_h = (int(v) for v in args.resolution.split('x'))
+    except ValueError:
+        logger.error(f"Invalid resolution format '{args.resolution}', expected WxH (e.g. 1280x960)")
+        return 1
 
     # Check Hailo availability
     if not is_hailo_available():
@@ -437,11 +396,11 @@ Examples:
 
     # Initialize pipeline
     try:
-        pipeline = UnifiedHailoInsightFacePipeline(
+        pipeline = FaceAnalysisPipeline(
             sensor_id=args.sensor_id,
             hailo_model_path=args.hailo_model,
             face_confidence=args.face_conf,
-            insightface_model=args.insightface_model,
+            age_gender_model=args.age_gender_model,
             max_age=args.max_age,
             min_hits=args.min_hits,
             iou_threshold=args.iou_threshold
@@ -449,6 +408,9 @@ Examples:
     except Exception as e:
         logger.error(f"Failed to initialize pipeline: {e}")
         return 1
+    
+    # Initialize API client (reads from .env)
+    api_client = create_client_from_env()
 
     # Initialize JSON logger
     json_logger = None
@@ -457,10 +419,9 @@ Examples:
 
     # Open input source
     if args.input == 'camera':
-        # Try Picamera2 first (Pi Camera Module), fall back to OpenCV
         try:
-            cap = PiCameraCapture(width=640, height=480, framerate=30)
-            logger.info("Using Pi Camera via Picamera2")
+            cap = PiCameraCapture(width=res_w, height=res_h, framerate=30)
+            logger.info(f"Using Pi Camera via Picamera2 ({res_w}x{res_h})")
         except Exception as e:
             logger.warning(f"Picamera2 not available ({e}), trying OpenCV...")
             cap = cv2.VideoCapture(0)
@@ -473,7 +434,7 @@ Examples:
         logger.error(f"Failed to open input: {args.input}")
         return 1
 
-    # Video writer (if saving)
+    # Video writer
     video_writer = None
     if args.output_video:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -483,7 +444,7 @@ Examples:
         video_writer = cv2.VideoWriter(args.output_video, fourcc, fps, (width, height))
         logger.info(f"Saving video to: {args.output_video}")
 
-    # Snapshot directory for remote monitoring
+    # Snapshots
     snapshot_dir = None
     if args.snapshot_dir:
         snapshot_dir = Path(args.snapshot_dir)
@@ -513,31 +474,43 @@ Examples:
             frame_count += 1
             frame_start = time.time()
 
-            # Process frame
             tracked_persons, client_output = pipeline.process_frame(frame)
             frame_time = time.time() - frame_start
 
-            # Log to JSON file at specified interval
+            # Log/send at specified interval
             current_time = time.time()
-            if json_logger and len(client_output['detections']) > 0:
-                if current_time - last_log_time >= args.log_interval:
-                    # Filter detections by minimum confidence
-                    filtered_output = client_output.copy()
-                    filtered_output['detections'] = [
-                        d for d in client_output['detections']
-                        if d.get('confidence', 0) >= args.min_confidence
-                    ]
-                    if len(filtered_output['detections']) > 0:
-                        json_logger.log(filtered_output)
-                        last_log_time = current_time
+            should_report = current_time - last_log_time >= args.log_interval
 
-            # Calculate FPS
+            if should_report and len(client_output['detections']) > 0:
+                # Filter by min confidence
+                confident_detections = [
+                    d for d in client_output['detections']
+                    if d.get('confidence', 0) >= args.min_confidence
+                ]
+                confident_persons = [
+                    p for p in tracked_persons
+                    if p.confidence >= args.min_confidence
+                ]
+
+                if confident_detections:
+                    # JSONL log
+                    if json_logger:
+                        filtered_output = client_output.copy()
+                        filtered_output['detections'] = confident_detections
+                        json_logger.log(filtered_output)
+
+                    # VisionCraft API
+                    if api_client and confident_persons:
+                        api_client.send_detections_async(confident_persons)
+
+                    last_log_time = current_time
+
+            # FPS
             fps_display = 1.0 / frame_time if frame_time > 0 else 0
 
-            # Draw annotations
+            # Annotate
             annotated = draw_annotations(frame, tracked_persons, show_ids=not args.no_ids)
 
-            # Add overlay info
             stats = pipeline.get_tracker_stats()
             cv2.putText(annotated, f"FPS: {fps_display:.1f}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -550,7 +523,7 @@ Examples:
 
             # Display
             if args.display:
-                cv2.imshow('Hailo + InsightFace + Kalman Tracking', annotated)
+                cv2.imshow('Face Analysis Pipeline', annotated)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
@@ -558,7 +531,7 @@ Examples:
             if video_writer:
                 video_writer.write(annotated)
 
-            # Save periodic snapshots for remote monitoring
+            # Snapshots
             if snapshot_dir and (current_time - last_snapshot_time >= args.snapshot_interval):
                 snapshot_name = datetime.now().strftime("%Y%m%d_%H%M%S.jpg")
                 snapshot_path = snapshot_dir / snapshot_name
@@ -566,13 +539,12 @@ Examples:
                 logger.info(f"Snapshot saved: {snapshot_path}")
                 last_snapshot_time = current_time
 
-            # Print progress and sample output
+            # Progress
             if frame_count % 30 == 0:
                 elapsed = time.time() - start_time
                 avg_fps = frame_count / elapsed
                 logger.info(f"Frame {frame_count}: {len(tracked_persons)} tracked, FPS: {avg_fps:.1f}")
 
-                # Print sample JSON output
                 if tracked_persons:
                     print(f"\n--- Frame {frame_count} JSON Output ---")
                     print(json.dumps(client_output, indent=2))
@@ -581,7 +553,6 @@ Examples:
         logger.info("Interrupted by user")
 
     finally:
-        # Cleanup
         cap.release()
         if video_writer:
             video_writer.release()
@@ -590,7 +561,6 @@ Examples:
 
         pipeline.cleanup()
 
-        # Summary
         total_time = time.time() - start_time
         avg_fps = frame_count / total_time if total_time > 0 else 0
         stats = pipeline.get_tracker_stats()

@@ -1,28 +1,18 @@
 """
-Robust Person Tracker using Kalman Filter and Hungarian Algorithm
-
-This tracker provides consistent person IDs across frames, handling:
-- Brief occlusions (person temporarily out of frame)
-- Re-identification when person returns
-- Smooth bounding box predictions
-- Multiple overlapping detections
-
-Based on SORT (Simple Online Realtime Tracking) algorithm.
+Person Tracker using Kalman Filter and Hungarian Algorithm.
 """
-
 import numpy as np
 from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, field
 from collections import deque
-import time
 import logging
 
-# Try to import scipy for Hungarian algorithm, fallback to greedy if not available
 try:
     from scipy.optimize import linear_sum_assignment
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
+
+from ..utils.types import TrackedPerson
 
 logger = logging.getLogger(__name__)
 
@@ -32,61 +22,42 @@ class KalmanBoxTracker:
     Kalman Filter for tracking a single bounding box.
 
     State vector: [x_center, y_center, area, aspect_ratio, vx, vy, va]
-    - x_center, y_center: box center position
-    - area: box area (width * height)
-    - aspect_ratio: width / height
-    - vx, vy, va: velocities
     """
 
-    count = 0  # Class variable for unique ID generation
+    count = 0
 
     def __init__(self, bbox: Tuple[int, int, int, int]):
-        """
-        Initialize tracker with bounding box.
-
-        Args:
-            bbox: (x1, y1, x2, y2) format
-        """
-        # State: [x, y, area, ratio, vx, vy, va]
         self.dim_x = 7
         self.dim_z = 4
 
-        # State vector
         self.x = np.zeros((self.dim_x, 1))
 
-        # State covariance matrix
         self.P = np.eye(self.dim_x)
-        self.P[4:, 4:] *= 1000.0  # High uncertainty for velocities
+        self.P[4:, 4:] *= 1000.0
         self.P *= 10.0
 
-        # State transition matrix
         self.F = np.eye(self.dim_x)
-        self.F[0, 4] = 1  # x += vx
-        self.F[1, 5] = 1  # y += vy
-        self.F[2, 6] = 1  # area += va
+        self.F[0, 4] = 1
+        self.F[1, 5] = 1
+        self.F[2, 6] = 1
 
-        # Measurement matrix
         self.H = np.zeros((self.dim_z, self.dim_x))
-        self.H[0, 0] = 1  # x
-        self.H[1, 1] = 1  # y
-        self.H[2, 2] = 1  # area
-        self.H[3, 3] = 1  # ratio
+        self.H[0, 0] = 1
+        self.H[1, 1] = 1
+        self.H[2, 2] = 1
+        self.H[3, 3] = 1
 
-        # Measurement noise
         self.R = np.eye(self.dim_z)
-        self.R[2, 2] *= 10.0  # area measurement noise
-        self.R[3, 3] *= 10.0  # ratio measurement noise
+        self.R[2, 2] *= 10.0
+        self.R[3, 3] *= 10.0
 
-        # Process noise
         self.Q = np.eye(self.dim_x)
         self.Q[4:, 4:] *= 0.01
         self.Q[2, 2] *= 0.01
         self.Q[3, 3] *= 0.01
 
-        # Initialize state from bbox
         self.x[:4] = self._bbox_to_z(bbox)
 
-        # Tracking metadata
         KalmanBoxTracker.count += 1
         self.id = KalmanBoxTracker.count
         self.hits = 1
@@ -94,11 +65,9 @@ class KalmanBoxTracker:
         self.age = 0
         self.time_since_update = 0
 
-        # Store history for smoothing
         self.history: deque = deque(maxlen=30)
 
     def _bbox_to_z(self, bbox: Tuple[int, int, int, int]) -> np.ndarray:
-        """Convert bbox (x1,y1,x2,y2) to measurement (cx, cy, area, ratio)."""
         x1, y1, x2, y2 = bbox
         w = x2 - x1
         h = y2 - y1
@@ -109,7 +78,6 @@ class KalmanBoxTracker:
         return np.array([[cx], [cy], [area], [ratio]])
 
     def _z_to_bbox(self, z: np.ndarray) -> Tuple[int, int, int, int]:
-        """Convert measurement (cx, cy, area, ratio) to bbox (x1,y1,x2,y2)."""
         cx, cy, area, ratio = z.flatten()
         area = max(area, 1.0)
         ratio = max(ratio, 0.1)
@@ -122,70 +90,43 @@ class KalmanBoxTracker:
         return (x1, y1, x2, y2)
 
     def predict(self) -> Tuple[int, int, int, int]:
-        """
-        Advance state and return predicted bbox.
-
-        Returns:
-            Predicted bounding box (x1, y1, x2, y2)
-        """
-        # Prevent negative area
         if self.x[2] + self.x[6] <= 0:
             self.x[6] = 0
 
-        # Predict
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
 
         self.age += 1
         self.time_since_update += 1
 
-        # Store prediction in history
         bbox = self._z_to_bbox(self.x[:4])
         self.history.append(bbox)
 
         return bbox
 
     def update(self, bbox: Tuple[int, int, int, int]) -> None:
-        """
-        Update state with observed bbox.
-
-        Args:
-            bbox: Observed bounding box (x1, y1, x2, y2)
-        """
         self.time_since_update = 0
         self.hits += 1
         self.hit_streak += 1
 
-        # Measurement
         z = self._bbox_to_z(bbox)
 
-        # Kalman update
-        y = z - self.H @ self.x  # Innovation
-        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        y = z - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
 
         self.x = self.x + K @ y
         self.P = (np.eye(self.dim_x) - K @ self.H) @ self.P
 
     def get_state(self) -> Tuple[int, int, int, int]:
-        """Get current state as bbox."""
         return self._z_to_bbox(self.x[:4])
 
 
 def calculate_iou(box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int]) -> float:
-    """
-    Calculate IoU between two bounding boxes.
-
-    Args:
-        box1, box2: Boxes in (x1, y1, x2, y2) format
-
-    Returns:
-        IoU value between 0 and 1
-    """
+    """Calculate IoU between two bounding boxes in (x1, y1, x2, y2) format."""
     x1_1, y1_1, x2_1, y2_1 = box1
     x1_2, y1_2, x2_2, y2_2 = box2
 
-    # Intersection
     xi1 = max(x1_1, x1_2)
     yi1 = max(y1_1, y1_2)
     xi2 = min(x2_1, x2_2)
@@ -196,7 +137,6 @@ def calculate_iou(box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, in
 
     intersection = (xi2 - xi1) * (yi2 - yi1)
 
-    # Union
     area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
     area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
     union = area1 + area2 - intersection
@@ -239,7 +179,6 @@ def hungarian_assignment(cost_matrix: np.ndarray, threshold: float) -> Tuple[Lis
     if SCIPY_AVAILABLE:
         row_indices, col_indices = linear_sum_assignment(cost_matrix)
     else:
-        # Fallback to greedy assignment
         row_indices, col_indices = [], []
         cost_copy = cost_matrix.copy()
         n_rows, n_cols = cost_matrix.shape
@@ -273,172 +212,42 @@ def hungarian_assignment(cost_matrix: np.ndarray, threshold: float) -> Tuple[Lis
     return matches, unmatched_rows, unmatched_cols
 
 
-@dataclass
-class TrackedPerson:
-    """Represents a tracked person with all attributes."""
-    id: int
-    bbox: Tuple[int, int, int, int]
-    confidence: float
-    gender: str = "unknown"
-    gender_confidence: float = 0.0
-    age: float = 0.0
-    hits: int = 1
-    time_since_update: int = 0
-
-    def to_client_format(self) -> Dict:
-        """Convert to client JSON format."""
-        x1, y1, x2, y2 = self.bbox
-        width = x2 - x1
-        height = y2 - y1
-        xc = x1 + width // 2
-        yc = y1 + height // 2
-
-        return {
-            "id": self.id,
-            "age": round(self.age, 1),
-            "gender": self.gender.lower(),
-            "confidence": round(self.confidence, 2),
-            "bbox": {
-                "xc": xc,
-                "yc": yc,
-                "width": width,
-                "height": height,
-                "top": y1,
-                "left": x1
-            }
-        }
-
-
 class KalmanPersonTracker:
     """
-    Robust multi-person tracker using Kalman filter and Hungarian algorithm.
+    Multi-person tracker using Kalman filter and Hungarian algorithm.
 
     Features:
     - Kalman filter for smooth tracking and prediction
     - Hungarian algorithm for optimal assignment
-    - Handles occlusions and re-identification
-    - Configurable max_age for track retention
-    - ReID: Face embedding gallery for re-identifying returning persons
+    - Handles occlusions
+    - Gender majority voting and age EMA
     """
 
-    # ReID configuration
-    REID_SIMILARITY_THRESHOLD = 0.4   # Cosine similarity threshold (lowered for better recall)
-    GALLERY_MAX_AGE_SECONDS = 600     # How long to remember lost tracks (10 min)
-    GALLERY_MAX_SIZE = 100            # Maximum tracks to store in gallery
-    USE_REID = True                   # Feature flag to enable/disable ReID
+    # Compensates for the classifier's systematic age underestimation.
+    # The ONNX model consistently predicts ~5 years too young.
+    AGE_OFFSET = 5
 
     def __init__(
         self,
         sensor_id: str = "SENSOR_001",
-        max_age: int = 30,          # Frames to keep track without detection
-        min_hits: int = 3,           # Minimum hits to confirm track
-        iou_threshold: float = 0.25  # Minimum IoU for association
+        max_age: int = 30,
+        min_hits: int = 3,
+        iou_threshold: float = 0.25
     ):
-        """
-        Initialize tracker.
-
-        Args:
-            sensor_id: Unique sensor/camera identifier
-            max_age: Maximum frames to retain unmatched tracks
-            min_hits: Minimum detections before track is confirmed
-            iou_threshold: Minimum IoU for detection-track association
-        """
         self.sensor_id = sensor_id
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
 
         self.trackers: List[KalmanBoxTracker] = []
-        self.track_attributes: Dict[int, Dict] = {}  # Store gender/age per track
+        self.track_attributes: Dict[int, Dict] = {}
 
-        # ReID: Gallery for storing embeddings of lost tracks
-        self.track_gallery: Dict[int, Dict] = {}
-        # Gallery entry format: {
-        #     'embedding': np.ndarray (512-dim),
-        #     'last_seen': float (timestamp),
-        #     'attributes': dict (gender, age, etc.)
-        # }
-
-        # Reset ID counter for fresh start
         KalmanBoxTracker.count = 0
 
         logger.info(
             f"KalmanPersonTracker initialized: sensor={sensor_id}, "
-            f"max_age={max_age}, min_hits={min_hits}, iou_threshold={iou_threshold}, "
-            f"reid={'enabled' if self.USE_REID else 'disabled'}"
+            f"max_age={max_age}, min_hits={min_hits}, iou_threshold={iou_threshold}"
         )
-
-    def _find_gallery_match(self, embedding: np.ndarray) -> Optional[int]:
-        """
-        Find matching track ID in gallery using cosine similarity.
-
-        Args:
-            embedding: 512-dim L2-normalized face embedding
-
-        Returns:
-            Track ID of best match, or None if no match above threshold
-        """
-        if embedding is None or not self.USE_REID:
-            return None
-
-        best_id = None
-        best_sim = 0.0
-        current_time = time.time()
-        expired_ids = []
-
-        for track_id, data in self.track_gallery.items():
-            # Check for expired entries
-            if current_time - data['last_seen'] > self.GALLERY_MAX_AGE_SECONDS:
-                expired_ids.append(track_id)
-                continue
-
-            gallery_emb = data.get('embedding')
-            if gallery_emb is None:
-                continue
-
-            # Cosine similarity (embeddings are L2-normalized, so dot product = cosine sim)
-            similarity = float(np.dot(embedding, gallery_emb))
-
-            if similarity > self.REID_SIMILARITY_THRESHOLD and similarity > best_sim:
-                best_sim = similarity
-                best_id = track_id
-
-        # Clean up expired entries
-        for track_id in expired_ids:
-            del self.track_gallery[track_id]
-
-        if best_id is not None:
-            logger.info(f"ReID: Person {best_id} returned! (similarity={best_sim:.3f})")
-
-        return best_id
-
-    def _save_to_gallery(self, track_id: int, attrs: Dict) -> None:
-        """
-        Save a track's embedding to the gallery before deletion.
-
-        Args:
-            track_id: The track ID being removed
-            attrs: Track attributes including embedding
-        """
-        if not self.USE_REID:
-            return
-
-        embedding = attrs.get('embedding')
-        if embedding is None:
-            return
-
-        self.track_gallery[track_id] = {
-            'embedding': embedding,
-            'last_seen': time.time(),
-            'attributes': attrs.copy()
-        }
-        logger.info(f"ReID: Saved track {track_id} to gallery (gallery size: {len(self.track_gallery)})")
-
-        # Limit gallery size by removing oldest entry
-        if len(self.track_gallery) > self.GALLERY_MAX_SIZE:
-            oldest_id = min(self.track_gallery, key=lambda k: self.track_gallery[k]['last_seen'])
-            del self.track_gallery[oldest_id]
-            logger.debug(f"Gallery full, removed oldest track {oldest_id}")
 
     def update(self, detections: List[Dict]) -> List[TrackedPerson]:
         """
@@ -455,12 +264,10 @@ class KalmanPersonTracker:
         Returns:
             List of TrackedPerson objects with stable IDs
         """
-        # Convert detections to standard format
         det_bboxes = []
         det_data = []
 
         for det in detections:
-            # Handle different bbox formats
             if 'bbox' in det:
                 bbox = det['bbox']
             elif 'box' in det:
@@ -476,7 +283,6 @@ class KalmanPersonTracker:
                 'gender': det.get('gender', 'unknown'),
                 'gender_confidence': det.get('gender_confidence', 0.0),
                 'age': det.get('age', 0.0),
-                'embedding': det.get('embedding')  # For ReID
             })
 
         # Predict new locations for existing trackers
@@ -494,7 +300,6 @@ class KalmanPersonTracker:
         for tracker_idx, det_idx in matches:
             self.trackers[tracker_idx].update(det_bboxes[det_idx])
 
-            # Update attributes (use exponential moving average for stability)
             track_id = self.trackers[tracker_idx].id
             det = det_data[det_idx]
 
@@ -513,13 +318,12 @@ class KalmanPersonTracker:
                     'confidence': det['confidence'],
                     'gender_votes_male': male_votes,
                     'gender_votes_female': female_votes,
-                    'embedding': det.get('embedding'),  # Store embedding for ReID
                 }
             else:
                 attrs = self.track_attributes[track_id]
-                alpha = 0.3  # Smoothing factor for age/confidence
+                alpha = 0.3
 
-                # Majority voting for gender (original logic - more stable)
+                # Majority voting for gender
                 if det['gender'] not in ('unknown', 'Unknown'):
                     if det['gender'] in ('male', 'Male'):
                         attrs['gender_votes_male'] = attrs.get('gender_votes_male', 0) + 1
@@ -533,6 +337,7 @@ class KalmanPersonTracker:
                         attrs['gender'] = 'male' if m >= f else 'female'
                         attrs['gender_confidence'] = max(m, f) / total
 
+                # Age EMA
                 if det['age'] > 0:
                     if attrs['age'] > 0:
                         attrs['age'] = alpha * det['age'] + (1 - alpha) * attrs['age']
@@ -541,55 +346,23 @@ class KalmanPersonTracker:
 
                 attrs['confidence'] = alpha * det['confidence'] + (1 - alpha) * attrs['confidence']
 
-                # Update embedding with latest (for ReID if track is lost later)
-                if det.get('embedding') is not None:
-                    attrs['embedding'] = det['embedding']
-
-        # Create new trackers for unmatched detections (with ReID check)
+        # Create new trackers for unmatched detections
         for det_idx in unmatched_detections:
             det = det_data[det_idx]
-            embedding = det.get('embedding')
+            new_tracker = KalmanBoxTracker(det_bboxes[det_idx])
 
-            # Try to match with gallery for ReID
-            gallery_match_id = self._find_gallery_match(embedding)
-
-            if gallery_match_id is not None:
-                # Resurrect track with original ID
-                new_tracker = KalmanBoxTracker(det_bboxes[det_idx])
-                new_tracker.id = gallery_match_id  # REUSE OLD ID
-                KalmanBoxTracker.count -= 1  # Don't increment counter (was already incremented in __init__)
-
-                # Restore attributes from gallery and update with new detection
-                gallery_data = self.track_gallery.pop(gallery_match_id)
-                restored_attrs = gallery_data['attributes'].copy()
-                # Update with new embedding
-                if embedding is not None:
-                    restored_attrs['embedding'] = embedding
-                self.track_attributes[gallery_match_id] = restored_attrs
-            else:
-                # Create truly new track
-                new_tracker = KalmanBoxTracker(det_bboxes[det_idx])
-
-                male_votes = 1 if det['gender'] in ('male', 'Male') else 0
-                female_votes = 1 if det['gender'] in ('female', 'Female') else 0
-                total_votes = male_votes + female_votes
-                self.track_attributes[new_tracker.id] = {
-                    'gender': det['gender'],
-                    'gender_confidence': max(male_votes, female_votes) / total_votes if total_votes > 0 else 0.0,
-                    'age': det['age'],
-                    'confidence': det['confidence'],
-                    'gender_votes_male': male_votes,
-                    'gender_votes_female': female_votes,
-                    'embedding': embedding,  # Store embedding for ReID
-                }
-
+            male_votes = 1 if det['gender'] in ('male', 'Male') else 0
+            female_votes = 1 if det['gender'] in ('female', 'Female') else 0
+            total_votes = male_votes + female_votes
+            self.track_attributes[new_tracker.id] = {
+                'gender': det['gender'],
+                'gender_confidence': max(male_votes, female_votes) / total_votes if total_votes > 0 else 0.0,
+                'age': det['age'],
+                'confidence': det['confidence'],
+                'gender_votes_male': male_votes,
+                'gender_votes_female': female_votes,
+            }
             self.trackers.append(new_tracker)
-
-        # Save to gallery before removing dead trackers (for ReID)
-        for tracker in self.trackers:
-            if tracker.time_since_update > self.max_age:
-                attrs = self.track_attributes.get(tracker.id, {})
-                self._save_to_gallery(tracker.id, attrs)
 
         # Remove dead trackers
         self.trackers = [t for t in self.trackers if t.time_since_update <= self.max_age]
@@ -597,17 +370,17 @@ class KalmanPersonTracker:
         # Build output - only confirmed tracks
         results = []
         for tracker in self.trackers:
-            # Only output if track has enough hits or was just updated
             if tracker.hits >= self.min_hits or tracker.time_since_update == 0:
                 attrs = self.track_attributes.get(tracker.id, {})
-
+                raw_age = attrs.get('age', 0.0)
+                corrected_age = raw_age + self.AGE_OFFSET if raw_age > 0 else 0.0
                 person = TrackedPerson(
                     id=tracker.id,
                     bbox=tracker.get_state(),
                     confidence=attrs.get('confidence', 0.5),
                     gender=attrs.get('gender', 'unknown'),
                     gender_confidence=attrs.get('gender_confidence', 0.0),
-                    age=attrs.get('age', 0.0),
+                    age=corrected_age,
                     hits=tracker.hits,
                     time_since_update=tracker.time_since_update
                 )
@@ -620,44 +393,25 @@ class KalmanPersonTracker:
         tracker_bboxes: List[Tuple[int, int, int, int]],
         detection_bboxes: List[Tuple[int, int, int, int]]
     ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
-        """
-        Associate detections with trackers using Hungarian algorithm.
-
-        Returns:
-            Tuple of (matches, unmatched_trackers, unmatched_detections)
-        """
+        """Associate detections with trackers using Hungarian algorithm."""
         if len(tracker_bboxes) == 0:
             return [], [], list(range(len(detection_bboxes)))
-
         if len(detection_bboxes) == 0:
             return [], list(range(len(tracker_bboxes))), []
 
-        # Calculate IoU matrix
         iou_matrix = calculate_iou_matrix(tracker_bboxes, detection_bboxes)
-
-        # Convert to cost matrix (negative IoU)
         cost_matrix = -iou_matrix
-
-        # Run Hungarian algorithm
-        matches, unmatched_trackers, unmatched_detections = hungarian_assignment(
-            cost_matrix, -self.iou_threshold
-        )
-
-        return matches, unmatched_trackers, unmatched_detections
+        return hungarian_assignment(cost_matrix, -self.iou_threshold)
 
     def get_active_count(self) -> int:
-        """Get number of active tracks."""
         return len([t for t in self.trackers if t.time_since_update == 0])
 
     def get_total_count(self) -> int:
-        """Get total unique persons tracked."""
         return KalmanBoxTracker.count
 
     def reset(self) -> None:
-        """Reset tracker state."""
         self.trackers.clear()
         self.track_attributes.clear()
-        self.track_gallery.clear()  # Clear ReID gallery
         KalmanBoxTracker.count = 0
         logger.info("Tracker reset")
 
@@ -667,17 +421,7 @@ def format_output_json(
     sensor_id: str,
     timestamp: Optional[str] = None
 ) -> Dict:
-    """
-    Format tracked persons to client JSON specification.
-
-    Args:
-        tracked_persons: List of TrackedPerson objects
-        sensor_id: Sensor/camera identifier
-        timestamp: Optional timestamp string (auto-generated if None)
-
-    Returns:
-        Client-formatted JSON dict
-    """
+    """Format tracked persons to client JSON specification."""
     from datetime import datetime
 
     if timestamp is None:
