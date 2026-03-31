@@ -23,20 +23,6 @@ class AgeGenderClassifier:
     def __init__(self, model_path: Optional[str] = None):
         """
         Initialize the HSE MobileNet ONNX age/gender classifier.
-
-        Preprocessing (from av-savchenko/HSE_FaceRec_tf facial_analysis.py):
-          1. Resize to 224x224
-          2. BGR → RGB
-          3. Subtract [103.939, 116.779, 123.68] per channel
-          4. NHWC batch dimension
-
-        Outputs:
-          - age_pred/Softmax  : softmax over 101 age classes (ages 1-101)
-          - gender_pred/Sigmoid: single sigmoid (>=0.6 → male)
-
-        Args:
-            model_path: Path to the ONNX model file. If None, looks for
-                        models/age_gender.onnx relative to project root.
         """
         if ort is None:
             raise ImportError(

@@ -44,7 +44,7 @@ class UnifiedHailoFaceDetector:
         confidence_threshold: float = 0.4,
         nms_threshold: float = 0.4,
         device_id: str = "0",
-        min_face_size: int = 20
+        min_face_size: int = 35 #changed from 20 to 35 because we want to detect only faces that are closer than 5m
     ):
         """
         Initialize Hailo face detector.
@@ -228,7 +228,6 @@ class UnifiedHailoFaceDetector:
         Both RetinaFace and SCRFD output 9 tensors: 3 FPN levels x 3 types each.
         Auto-detection uses classification channel count:
           - 4 channels = RetinaFace (2 anchors * 2 classes, softmax)
-          - 2 channels = SCRFD (2 anchors * 1 class, sigmoid)
         """
         min_sizes_per_level = [[16, 32], [64, 128], [256, 512]]
         steps = [8, 16, 32]

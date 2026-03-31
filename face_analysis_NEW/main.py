@@ -377,7 +377,7 @@ Examples:
 
     args = parser.parse_args()
 
-    # Load .env file (from face_analysis_NEW/ directory)
+    # Load .env file (project root, one level above face_analysis_NEW/)
     load_dotenv(Path(__file__).parent / ".env")
 
     # Parse resolution
@@ -560,6 +560,10 @@ Examples:
             cv2.destroyAllWindows()
 
         pipeline.cleanup()
+
+        # Revoke JWT tokens for clean session teardown
+        if api_client:
+            api_client.revoke()
 
         total_time = time.time() - start_time
         avg_fps = frame_count / total_time if total_time > 0 else 0
