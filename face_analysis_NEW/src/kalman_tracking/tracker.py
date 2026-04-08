@@ -223,10 +223,6 @@ class KalmanPersonTracker:
     - Gender majority voting and age EMA
     """
 
-    # Compensates for the classifier's systematic age underestimation.
-    # The ONNX model consistently predicts ~5 years too young.
-    AGE_OFFSET = 5
-
     def __init__(
         self,
         sensor_id: str = "SENSOR_001",
@@ -373,14 +369,13 @@ class KalmanPersonTracker:
             if tracker.hits >= self.min_hits or tracker.time_since_update == 0:
                 attrs = self.track_attributes.get(tracker.id, {})
                 raw_age = attrs.get('age', 0.0)
-                corrected_age = raw_age + self.AGE_OFFSET if raw_age > 0 else 0.0
                 person = TrackedPerson(
                     id=tracker.id,
                     bbox=tracker.get_state(),
                     confidence=attrs.get('confidence', 0.5),
                     gender=attrs.get('gender', 'unknown'),
                     gender_confidence=attrs.get('gender_confidence', 0.0),
-                    age=corrected_age,
+                    age=raw_age,
                     hits=tracker.hits,
                     time_since_update=tracker.time_since_update
                 )

@@ -41,14 +41,12 @@ class UnifiedHailoFaceDetector:
     def __init__(
         self,
         model_path: Optional[str] = None,
-        confidence_threshold: float = 0.6,
+        confidence_threshold: float = 0.7,
         nms_threshold: float = 0.4,
         device_id: str = "0",
-        min_face_size: int = 45 #changed from 20 to 35 because we want to detect only faces that are closer than 5m
+        min_face_size: int = 80 #changed from 20 to 80 because we want to detect only faces that are closer than 5m
     ):
         """
-        Initialize Hailo face detector.
-
         Args:
             model_path: Path to .hef model file
             confidence_threshold: Minimum confidence (0.0-1.0)

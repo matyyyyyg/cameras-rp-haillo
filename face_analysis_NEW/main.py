@@ -338,21 +338,14 @@ Examples:
                         help='Unique sensor/camera identifier')
 
     # Detection
-    parser.add_argument('--hailo-model', type=str, default=None,
-                        help='Path to Hailo face detection HEF')
-    parser.add_argument('--face-conf', type=float, default=0.5,
+    parser.add_argument('--face-conf', type=float, default= UnifiedHailoFaceDetector.confidence_threshold,
                         help='Face detection confidence threshold')
-    parser.add_argument('--age-gender-model', type=str, default=None,
-                        help='Path to ONNX age/gender model')
 
     # Tracking
     parser.add_argument('--max-age', type=int, default=60,
                         help='Max frames to keep track without detection')
     parser.add_argument('--min-hits', type=int, default=3,
                         help='Min detections to confirm track')
-    parser.add_argument('--iou-threshold', type=float, default=0.15,
-                        help='Min IoU for track association')
-
     # Logging frequency
     parser.add_argument('--log-interval', type=float, default=1.0,
                         help='Log detections every N seconds (default: 1.0)')
@@ -366,15 +359,7 @@ Examples:
     # Display
     parser.add_argument('--display', action='store_true',
                         help='Display output video window')
-    parser.add_argument('--no-ids', action='store_true',
-                        help='Hide tracking IDs in display')
-
-    # Snapshots
-    parser.add_argument('--snapshot-dir', type=str, default=None,
-                        help='Directory to save periodic snapshots')
-    parser.add_argument('--snapshot-interval', type=float, default=60.0,
-                        help='Save snapshot every N seconds (default: 60)')
-
+    
     args = parser.parse_args()
 
     # Load .env file (project root, one level above face_analysis_NEW/)
