@@ -258,6 +258,7 @@ class FaceAnalysisPipeline:
 
         # Format output
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        
         client_output = format_output_json(tracked_persons, self.sensor_id, timestamp)
 
         return tracked_persons, client_output
@@ -443,6 +444,8 @@ Examples:
     last_snapshot_time = time.time()
     fps_display = 0.0
 
+    sent_track_ids: set = set()
+
     logger.info("Starting processing... Press 'q' to quit")
     print("\n" + "=" * 60)
     print(f"Sensor ID: {args.sensor_id}")
@@ -484,9 +487,12 @@ Examples:
                         filtered_output['detections'] = confident_detections
                         json_logger.log(filtered_output)
 
-                    # VisionCraft API
+                    # VisionCraft API — only send each person once
                     if api_client and confident_persons:
-                        api_client.send_detections_async(confident_persons)
+                        new_persons = [p for p in confident_persons if p.id not in sent_track_ids]
+                        if new_persons:
+                            api_client.send_detections_async(new_persons)
+                            sent_track_ids.update(p.id for p in new_persons)
 
                     last_log_time = current_time
 

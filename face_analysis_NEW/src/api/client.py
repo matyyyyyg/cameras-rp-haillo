@@ -240,7 +240,7 @@ class VisionCraftClient:
             return False
 
         if timestamp is None:
-            timestamp = datetime.now(timezone.utc).strftime(
+            timestamp = datetime.now().strftime(
                 "%Y-%m-%d %H:%M:%S.%f"
             )
 
@@ -249,6 +249,7 @@ class VisionCraftClient:
             token = self._access_token
 
         payload = {
+            "sensorId": self._sensor_id,
             "timestamp": timestamp,
             "detections": [p.to_client_format() for p in tracked_persons],
         }
